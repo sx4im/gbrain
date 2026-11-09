@@ -56,8 +56,42 @@ const FILES: Record<string, string> = {
     "    console.log('Usage: gbrain synthetic-example [--frobnicate]');",
     '    return;',
     '  }',
-    "  if (args.includes('--frobnicate')) await connect();",
+    "  if (args.includes('--frobnicate')) {",
+    "    await import('./synthetic-dep.ts');",
+    "    await import('./behavior-change-notice.ts');",
+    '    await connect();',
+    '  }',
     '}',
+    '',
+  ].join('\n'),
+  // #8867: a dep module whose git argv arrays and git() helper calls carry
+  // git's own flags, plus help text naming a flag the command never parses.
+  'src/commands/synthetic-dep.ts': [
+    "import { execFileSync } from 'child_process';",
+    'function git(root: string, args: string[]): string | null {',
+    "  try { return execFileSync('git', ['-C', root, ...args], { encoding: 'utf-8' }).toString(); } catch { return null; }",
+    '}',
+    'function syncGit(root: string, args: string[]): string { return root + args.join(" "); }',
+    "// A data table mapping positionals to real flags — ['status', '--status']",
+    '// is an array ELEMENT, not git argv, so --status/--install stay legal.',
+    "export const ALIASES = new Map([['status', '--status'], ['install', '--install']]);",
+    'export function checkDep(root: string): void {',
+    "  execFileSync('git', ['log', '--date=unix', '--porcelain'], { encoding: 'utf-8' });",
+    "  git(root, ['status', '--short']);",
+    "  syncGit(root, ['rev-parse', '--show-toplevel']);",
+    "  const statusArgs = ['status', '--porcelain'];",
+    "  execFileSync('git', statusArgs, { encoding: 'utf-8' });",
+    "  statusArgs.push('--untracked-files=no');",
+    "  console.log('Usage: gbrain synthetic-example [--dep-flag]');",
+    '}',
+    '',
+  ].join('\n'),
+  // #8867: a behavior-change notice module whose BEHAVIOR_CHANGES prose names
+  // an uncommitted `git merge --squash` — disclosure text, not a parsed flag.
+  'src/commands/behavior-change-notice.ts': [
+    'export const BEHAVIOR_CHANGES = [',
+    "  { since: '0.60.616.0', id: 'synthetic_notice_8867', text: 'Adoption keeps the file_database_drift refusal while an uncommitted `git merge --squash` is in progress.' },",
+    '];',
     '',
   ].join('\n'),
 };
@@ -85,6 +119,27 @@ describe('synthetic command registered through the table', () => {
     expect(findUnknownFlag(['legacy', '--legacy-mode'], legal)).toBeNull();
     expect(findUnknownFlag(['--frobnicate', '--definitely-not-a-flag'], legal)).toBe('--definitely-not-a-flag');
     expect(findUnknownFlag(['--help'], legal)).toBeNull();
+  });
+
+  test('#8867: git argv and behavior-change prose do not legalise flags', () => {
+    const legal = new Set(buildFlagRegistry(root)['synthetic-example']);
+    // Help-text over-inclusion is deliberate: --dep-flag stays legal.
+    expect(legal.has('--dep-flag')).toBe(true);
+    // Git argv: --date=unix / --porcelain from the spawn array, --short from
+    // the local git() helper call — git's flags, never parsed by the command.
+    expect(legal.has('--date')).toBe(false);
+    expect(legal.has('--porcelain')).toBe(false);
+    expect(legal.has('--short')).toBe(false);
+    // --show-toplevel from a git-helper call's array, --untracked-files
+    // from a variable argv's .push — both git argv, not command flags.
+    expect(legal.has('--show-toplevel')).toBe(false);
+    expect(legal.has('--untracked-files')).toBe(false);
+    // The ALIASES data table maps positionals to REAL flags: its array
+    // elements are not git argv, so --status/--install stay legal.
+    expect(legal.has('--status')).toBe(true);
+    expect(legal.has('--install')).toBe(true);
+    // BEHAVIOR_CHANGES prose naming `git merge --squash` is not a flag.
+    expect(legal.has('--squash')).toBe(false);
   });
 
   test('its module answers --help without connecting an engine', async () => {

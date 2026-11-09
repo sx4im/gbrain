@@ -248,6 +248,22 @@ describe('#2185 red-team regressions', () => {
     expect(validateCommandFlags('jobs', ['work', '--allow-shell-jobs'])).toBeNull();
     expect(validateCommandFlags('jobs', ['run-child', '--job-id', '1', '--allow-shell-jobs'])).toBeNull();
   });
+
+  test('#8867: git argv and changelog prose do not legalise flags for doctor/init', () => {
+    // scripts/generate-flag-registry.ts collected every --flag literal in a
+    // command's dispatch text and imported modules: --squash leaked from a
+    // BEHAVIOR_CHANGES row (prose naming an uncommitted `git merge --squash`)
+    // in src/core/behavior-change-notice.ts, and --porcelain/--show-toplevel
+    // from the git argv arrays the doctor checks pass to their git runners.
+    // Neither command parses any of them: `gbrain doctor --squash` ran as
+    // plain `gbrain doctor` instead of refusing an unknown flag.
+    expect(CLI_FLAG_REGISTRY['doctor']).not.toContain('--squash');
+    expect(CLI_FLAG_REGISTRY['init']).not.toContain('--squash');
+    expect(validateCommandFlags('doctor', ['--squash'])).toBe('--squash');
+    expect(validateCommandFlags('init', ['--squash'])).toBe('--squash');
+    expect(validateCommandFlags('doctor', ['--porcelain'])).toBe('--porcelain');
+    expect(validateCommandFlags('doctor', ['--show-toplevel'])).toBe('--show-toplevel');
+  });
 });
 
 describe('#2185 drift + freshness guards', () => {
