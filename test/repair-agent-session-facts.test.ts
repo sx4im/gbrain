@@ -7,7 +7,9 @@
  * is listed ambiguous and applied only with --include-ambiguous; a claim the owner also stated is kept; facts of a
  * session with no retained corpus are counted and untouched; fenced rows are rewritten in their page and database-only
  * rows in place; a fact/self take is retired only when every contributing fact is non-user; nothing is deleted; the
- * apply is bound to the preview hash and flags; a fact edited since the preview is kept.
+ * apply is bound to the preview hash and flags; a fact edited since the preview is kept; a fenced fact or take on a
+ * segmented page is listed kept in the preview and reported `segmented_page` by an apply that finds the page
+ * segmented since (#9027).
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -34,7 +36,7 @@ const ACME = 'companies/acme-example';
 const BRIEF = 'You are worker agent seven for the release crew. Read the brief below, follow the repository rules, keep commits small, '
   + 'and report back to the coordinator with a summary of what changed and what is still open.';
 
-interface RepairJson { results: Array<{ affected: number; residuals: Record<string, number>; apply_command: string; applied: number;
+interface RepairJson { results: Array<{ affected: number; residuals: Record<string, number>; apply_command: string; applied: number; warnings?: string[];
   listing?: Array<{ item: string; class: string; detail?: string }>; outcomes?: Record<string, number> }> }
 
 async function repair(engine: BrainEngine, args: string[]): Promise<RepairJson> {
@@ -281,6 +283,42 @@ describe('gbrain repair agent-session-facts, managed repo-less brain', () => {
         await seedEntity(engine, root, ALICE, 'Alice Example', 'person');
         await seedEntity(engine, root, ACME, 'Acme Example', 'company');
       } });
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  }, 180_000);
+
+  test('a page that turns segmented between preview and apply keeps its rows as segmented_page; a preview on a segmented page lists them kept', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'gbrain-agent-session-segmented-'));
+    try {
+      const { corpus } = corpusFixture(base);
+      await managedBrain(async ({ engine }) => {
+        await engine.setConfig('dream.synthesize.session_corpus_dir', corpus);
+        const write = (fact: string, entity: string | null) => writeSingleFact(engine, 'default', { fact, entity, provenance: 'hook:writeback', sessionId: 'sess-sidecar' }).then(r => r.id);
+        const fenced = await write('Alice Example prefers terse status updates', ALICE);
+        expect((await engine.executeRaw<{ row_num: number | null }>('SELECT row_num FROM facts WHERE id=$1', [fenced]))[0]!.row_num).not.toBeNull();
+        const before = await attribution(engine, fenced);
+
+        const preview = await repair(engine, []);
+        expect(classes(preview)).toEqual({ [fenced]: 'evidenced' });
+
+        // A direct pages UPDATE is refused inside a managed brain (the revision/search-vector
+        // triggers raise writer_coordinator_required for this role); the fixture flips the page
+        // to segmented storage directly, so all user triggers are paused for the one UPDATE and
+        // restored right after, the pattern doctor-revision-backfill uses for fixture writes.
+        await engine.executeRaw('ALTER TABLE pages DISABLE TRIGGER USER');
+        await engine.executeRaw(
+          "UPDATE pages SET body_storage='segmented', compiled_truth=NULL, timeline=NULL, body_bytes=octet_length(compiled_truth) WHERE slug=$1 AND source_id='default'",
+          [ALICE]);
+        await engine.executeRaw('ALTER TABLE pages ENABLE TRIGGER USER');
+        const applied = await repair(engine, applyArgs(preview));
+        expect(applied.results[0].outcomes).toEqual({ segmented_page: 1 });
+        expect(await attribution(engine, fenced)).toEqual(before);
+
+        const kept = await repair(engine, []);
+        expect(classes(kept)).toEqual({ [fenced]: 'segmented_page' });
+        expect(kept.results[0].residuals).toMatchObject({ segmented_page: 1 });
+        expect(kept.results[0].warnings?.join(' ')).toContain('segmented_pages: 1 segmented page(s)');
+        expect(kept.results[0].listing!.find(l => l.item.endsWith(`#${fenced}`))!.detail).toContain('segmented page');
+      }, { setup: async ({ engine, root }) => { await seedEntity(engine, root, ALICE, 'Alice Example', 'person'); } });
     } finally { rmSync(base, { recursive: true, force: true }); }
   }, 180_000);
 });

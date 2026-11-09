@@ -37,6 +37,13 @@
  * fence by a revision-bound `put_page` when the fence holds it, otherwise in
  * the database by the same kind of request or transaction. A fact or take that
  * changed since the preview is reported `changed_since_preview` and kept.
+ *
+ * A fenced fact or take on a segmented page (whose body this repair does not
+ * rewrite) is listed as `segmented_page` and kept, in the preview and in an
+ * apply that finds the page segmented since: the preview counts it
+ * (`segmented_page`, `segmented_takes`) and warns instead of approving it,
+ * and the apply reports `segmented_page` for it — never
+ * `changed_since_preview`, which would claim a change that did not happen.
  */
 import { closeSync, existsSync, openSync, readdirSync, readSync, realpathSync, statSync, type Dirent } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
@@ -80,7 +87,7 @@ const HEAD_BYTES = 64 * 1024;
 const NOTE_SEPARATOR = CONTEXT_NOTE_SEPARATOR;
 const NOTE_MARK = 'speaker: agent ';
 
-export type AgentSessionFactClass = 'evidenced' | 'ambiguous' | 'excluded';
+export type AgentSessionFactClass = 'evidenced' | 'ambiguous' | 'excluded' | 'segmented_page';
 
 /** The operator's evidence flags: `--cwd <prefix>`, `--session <id>` (both repeatable) and `--principal <label>`. */
 export interface AgentSessionOptions { cwdPrefixes?: string[]; sessions?: string[]; principal?: string }
@@ -153,6 +160,13 @@ function canonicalPath(path: string): string {
 }
 
 const under = (path: string, prefix: string) => path === prefix || path.startsWith(prefix.endsWith(sep) ? prefix : prefix + sep);
+
+/** Pages of these sources whose body lives in segments, as `source\0slug` keys; this repair rewrites whole bodies, so it never touches them. */
+async function segmentedPageKeys(engine: BrainEngine, sourceIds: string[]): Promise<Set<string>> {
+  return new Set((await engine.executeRaw<{ source_id: string; slug: string }>(
+    `SELECT p.source_id, p.slug FROM pages p WHERE p.source_id=ANY($1::text[]) AND p.body_storage='segmented' AND p.deleted_at IS NULL`,
+    [sourceIds])).map(r => `${r.source_id}\u0000${r.slug}`));
+}
 
 function readHead(path: string): string {
   const fd = openSync(path, 'r');
@@ -275,6 +289,14 @@ export async function classifyAgentSessionFacts(db: BrainEngine, sourceIds: stri
       class: owner ? 'excluded' : hit.klass, reason: owner ? 'excluded:owner_also_said' : hit.reason, session: captureSessionId(row.source_session)!,
       evidence: hit.evidence, principal: hit.principal, fact_hash: factHash(row) });
   }
+  // A fenced row on a segmented page is kept, not approved: this repair rewrites whole bodies and never touches
+  // segmented pages. Database-only rows carry no page, so segmentation does not apply to them. An owner twin keeps
+  // its exclusion: the owner said it too, whatever the page's storage.
+  const fenced = candidates.filter(c => c.row_num !== null && c.class !== 'excluded');
+  if (fenced.length) {
+    const segmented = await segmentedPageKeys(db, sourceIds);
+    for (const c of fenced) if (segmented.has(`${c.source_id}\u0000${c.slug}`)) c.class = 'segmented_page';
+  }
   candidates.sort((a, b) => a.source_id.localeCompare(b.source_id) || a.slug.localeCompare(b.slug) || a.id - b.id);
   return { candidates, unclassifiable, not_suspect: notSuspect,
     unreadable_corpus_files: index.unreadable.map(path => !corpusDir ? path : relative(corpusDir, path) || basename(path)) };
@@ -358,20 +380,36 @@ export const agentSessionFactsRepair: RepairHandler = {
       const { candidates, unclassifiable, not_suspect, unreadable_corpus_files } = await classifyAgentSessionFacts(engine, scope.source_ids, options);
       const approvedFacts = candidates.filter(c => c.class === 'evidenced' || (c.class === 'ambiguous' && includeAmbiguous));
       const takes = await agentSessionTakes(engine, scope.source_ids, new Set(approvedFacts.map(c => c.id)));
+      // Takes on a segmented page are kept, like the facts: this repair rewrites whole bodies and never touches
+      // segmented pages. Their facts may still apply, on their own pages.
+      const segmentedPages = await segmentedPageKeys(engine, scope.source_ids);
+      const segmentedTakes = takes.filter(t => segmentedPages.has(`${t.source_id}\u0000${t.slug}`));
+      const approvedTakes = takes.filter(t => !segmentedPages.has(`${t.source_id}\u0000${t.slug}`));
       const hash = await hashOf(candidates, takes);
       const base = (row: { source_id: string; slug: string }) => ({ source_id: row.source_id, slug: row.slug, include_ambiguous: includeAmbiguous,
         scope: scope.source_ids, options: optionsKey });
-      const approved = [...groupByPage(approvedFacts, row => ({ ...base(row), facts: [] }), 'facts'), ...groupByPage(takes, row => ({ ...base(row), takes: [] }), 'takes')];
+      const approved = [...groupByPage(approvedFacts, row => ({ ...base(row), facts: [] }), 'facts'), ...groupByPage(approvedTakes, row => ({ ...base(row), takes: [] }), 'takes')];
       if (approved.length) await saveApprovedSet(engine, { command: COMMAND, hash }, approved);
       const count = (klass: AgentSessionFactClass) => candidates.filter(c => c.class === klass).length;
       const listing: RepairListing[] = candidates.map(c => ({ item: `${c.source_id}:${c.slug}#${c.id}`, class: c.class === 'excluded' ? c.reason : c.class,
-        detail: `${c.reason}; session ${c.session}; ${c.evidence}; principal ${c.principal}` }));
-      for (const take of takes) listing.push({ item: `${take.source_id}:${take.slug}@take:${take.id}`, class: 'take_to_retire',
+        detail: c.class === 'segmented_page'
+          ? `sits on segmented page ${c.slug}, which this repair does not rewrite, so it is kept; ${c.reason}; session ${c.session}; ${c.evidence}; principal ${c.principal}`
+          : `${c.reason}; session ${c.session}; ${c.evidence}; principal ${c.principal}` }));
+      for (const take of approvedTakes) listing.push({ item: `${take.source_id}:${take.slug}@take:${take.id}`, class: 'take_to_retire',
         detail: `row ${take.row_num}; contributing facts ${take.fact_ids.join(', ')}` });
+      for (const take of segmentedTakes) listing.push({ item: `${take.source_id}:${take.slug}@take:${take.id}`, class: 'segmented_page',
+        detail: `row ${take.row_num}; contributing facts ${take.fact_ids.join(', ')}; sits on segmented page ${take.slug}, which this repair does not rewrite, so it is kept` });
       for (const path of unreadable_corpus_files) listing.push({ item: path, class: 'unreadable_corpus_file',
         detail: 'not read (check its permissions); facts of its sessions are counted unclassifiable and kept' });
-      return { items: approved.map((page, i) => pageItem(page, hash, i, i === approved.length - 1, options)), preview_hash: hash, listing,
-        residuals: { evidenced: count('evidenced'), ambiguous: count('ambiguous'), excluded: count('excluded'), unclassifiable, not_suspect, takes_to_retire: takes.length,
+      const segmentedPageNames = [...new Set([...candidates.filter(c => c.class === 'segmented_page').map(c => `${c.source_id}:${c.slug}`),
+        ...segmentedTakes.map(t => `${t.source_id}:${t.slug}`)])];
+      const warnings = segmentedPageNames.length ? [`segmented_pages: ${segmentedPageNames.length} segmented page(s) `
+        + `(${segmentedPageNames.slice(0, 5).join(', ')}${segmentedPageNames.length > 5 ? ', …' : ''}) hold agent-session facts or takes and are left as they are: `
+        + 'this repair rewrites a whole body as one string, so it does not handle segmented pages, and no command does yet.'] : [];
+      return { ...(warnings.length ? { warnings } : {}), items: approved.map((page, i) => pageItem(page, hash, i, i === approved.length - 1, options)), preview_hash: hash, listing,
+        residuals: { evidenced: count('evidenced'), ambiguous: count('ambiguous'), excluded: count('excluded'), unclassifiable, not_suspect, takes_to_retire: approvedTakes.length,
+          ...(count('segmented_page') ? { segmented_page: count('segmented_page') } : {}),
+          ...(segmentedTakes.length ? { segmented_takes: segmentedTakes.length } : {}),
           ...(unreadable_corpus_files.length ? { unreadable_corpus_files: unreadable_corpus_files.length } : {}) } };
     }
     if (!opts.expect) {
@@ -393,27 +431,44 @@ export const agentSessionFactsRepair: RepairHandler = {
     const { page, hash, last, options } = entry as PageItem;
     const engine = ctx.engine;
     const done: number[] = [];
+    const segmented: number[] = [];
     if (page.facts) {
       const live = new Map((await classifyAgentSessionFacts(engine, [page.source_id], { ...options, ids: page.facts.map(f => f.id) })).candidates.map(c => [c.id, c]));
       const unchanged = page.facts.filter(f => {
         const current = live.get(f.id);
-        return !!current && (['class', 'reason', 'principal', 'fact_hash', 'slug', 'row_num'] as const).every(field => current[field] === f[field]);
+        if (!current) return false;
+        // A page that turned segmented since the preview keeps its rows: the storage, not an edit, stops the rewrite.
+        if (current.class === 'segmented_page' && current.fact_hash === f.fact_hash && current.slug === f.slug && current.row_num === f.row_num
+          && current.reason === f.reason && current.principal === f.principal) { segmented.push(f.id); return false; }
+        return (['class', 'reason', 'principal', 'fact_hash', 'slug', 'row_num'] as const).every(field => current[field] === f[field]);
       });
       const dbOnly = unchanged.filter(f => f.row_num === null);
       if (dbOnly.length) done.push(...await databaseWrite(engine, page, hash, { facts: dbOnly.map(f => ({ id: f.id, note: speakerContextNote(f.principal) })) }));
       const fenced = unchanged.filter(f => f.row_num !== null);
-      if (fenced.length) done.push(...await rewriteFencedFacts(ctx, entry, page, fenced));
+      if (fenced.length) {
+        const rewritten = await rewriteFencedFacts(ctx, entry, page, fenced);
+        if (rewritten === 'segmented') segmented.push(...fenced.map(f => f.id));
+        else done.push(...rewritten);
+      }
     } else {
       const live = new Map((await agentSessionTakes(engine, [page.source_id], new Set(), page.takes!.map(t => t.id))).map(t => [t.id, t]));
       const unchanged = page.takes!.filter(t => live.get(t.id)?.take_hash === t.take_hash);
-      if (unchanged.length) done.push(...await retireTakes(ctx, entry, page, hash, unchanged));
+      if (unchanged.length) {
+        const retired = await retireTakes(ctx, entry, page, hash, unchanged);
+        if (retired === 'segmented') segmented.push(...unchanged.map(t => t.id));
+        else done.push(...retired);
+      }
     }
     if (last) await clearApprovedSet(engine, { command: COMMAND, hash });
     const all = (page.facts ?? page.takes!).map(row => row.id);
-    const changed = all.filter(id => !done.includes(id));
+    const changed = all.filter(id => !done.includes(id) && !segmented.includes(id));
     const verb = page.facts ? 'reattributed' : 'retired';
-    return { applied: done.length > 0, outcome: !changed.length ? verb : done.length ? `partially_${verb}` : 'changed_since_preview',
-      ...(changed.length ? { reason: `${done.length} of ${all.length} ${verb}; changed since the preview: ${changed.join(', ')}` } : {}) };
+    const reasons = [...(segmented.length ? [`kept on a segmented page: ${segmented.join(', ')}`] : []),
+      ...(changed.length ? [`changed since the preview: ${changed.join(', ')}`] : [])];
+    return { applied: done.length > 0,
+      outcome: !changed.length && !segmented.length ? verb : done.length ? `partially_${verb}` : changed.length ? 'changed_since_preview' : 'segmented_page',
+      ...(reasons.length ? { reason: `${done.length} of ${all.length} ${verb}; ${reasons.join('; ')}` } : {}),
+      ...(segmented.length ? { detail: { segmented_page: segmented.length } } : {}) };
   },
 };
 
@@ -478,12 +533,14 @@ export async function prepareAgentSessionFactsWrite(engine: BrainEngine, row: Wr
 /**
  * Fenced facts: set `attributed_to: other` and append the note on each still-matching, still user-attributed active
  * fence row and publish the page once, bound to the revision read; the canonical projection rewrites the rows in
- * place. Returns the facts that now read back as `other`. A page stored in segments is not rewritten.
+ * place. Returns the facts that now read back as `other`, or `'segmented'` when the page stores its body in
+ * segments (the caller reports those rows kept on a segmented page, not changed).
  */
-async function rewriteFencedFacts(ctx: Parameters<RepairHandler['apply']>[0], item: RepairItem, page: ApprovedPage, facts: AgentSessionFactCandidate[]): Promise<number[]> {
+async function rewriteFencedFacts(ctx: Parameters<RepairHandler['apply']>[0], item: RepairItem, page: ApprovedPage, facts: AgentSessionFactCandidate[]): Promise<number[] | 'segmented'> {
   const engine = ctx.engine;
   const snapshot = await engine.readPageSnapshot(page.slug, { sourceId: page.source_id });
-  if (!snapshot || isSegmentedPage(snapshot.page)) return [];
+  if (!snapshot) return [];
+  if (isSegmentedPage(snapshot.page)) return 'segmented';
   const rows = await engine.executeRaw<{ id: number | string; fact: string; row_num: number }>(
     'SELECT id, fact, row_num FROM facts WHERE source_id=$1 AND id=ANY($2::bigint[]) AND expired_at IS NULL', [page.source_id, facts.map(f => f.id)]);
   let body = snapshot.page.compiled_truth ?? '';
@@ -508,13 +565,14 @@ async function rewriteFencedFacts(ctx: Parameters<RepairHandler['apply']>[0], it
 
 /**
  * Takes: a take the page's takes fence holds (same row and claim, active) is struck there by one revision-bound
- * `put_page` (the projection sets `active = false`); the rest are retired in the database. A page stored in
- * segments is not rewritten. Returns the retired takes.
+ * `put_page` (the projection sets `active = false`); the rest are retired in the database. Returns the retired
+ * takes, or `'segmented'` when the page stores its body in segments (the caller reports those takes kept on a
+ * segmented page, not changed).
  */
-async function retireTakes(ctx: Parameters<RepairHandler['apply']>[0], item: RepairItem, page: ApprovedPage, hash: string, takes: AgentSessionTake[]): Promise<number[]> {
+async function retireTakes(ctx: Parameters<RepairHandler['apply']>[0], item: RepairItem, page: ApprovedPage, hash: string, takes: AgentSessionTake[]): Promise<number[] | 'segmented'> {
   const engine = ctx.engine;
   const snapshot = await engine.readPageSnapshot(page.slug, { sourceId: page.source_id });
-  if (snapshot && isSegmentedPage(snapshot.page)) return [];
+  if (snapshot && isSegmentedPage(snapshot.page)) return 'segmented';
   const body = snapshot ? serializePageToMarkdown(snapshot.page, snapshot.tags) : '';
   const fence = parseTakesFence(body);
   const fenced = takes.filter(t => fence.takes.some(row => row.rowNum === t.row_num && row.claim.trim() === t.claim.trim() && row.active));
