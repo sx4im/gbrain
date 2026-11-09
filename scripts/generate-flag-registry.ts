@@ -22,7 +22,9 @@
  * flag for a command that merely imports one function from it. String
  * literals include help text, which deliberately over-includes: accepting a flag the handler
  * ignores is the pre-#2185 status quo for that flag, while missing a real
- * flag would break working invocations on upgrade.
+ * flag would break working invocations on upgrade. `--flag` literals that are
+ * git argv or data-table prose are blanked first (stripNonFlagSpans, #8867):
+ * a git argument is not a flag the command parses.
  *
  * Output: src/core/cli-flag-registry.generated.ts (committed; freshness is
  * pinned by test/cli-flag-validation.test.ts the same way build:llms pins the
@@ -34,6 +36,7 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
 import { dirname, resolve as resolvePath, join, sep } from 'path';
 import { fileURLToPath } from 'url';
+import ts from 'typescript';
 import { flattenCliPipeline, parseSource, readCommandModule, readTableRecords } from './lib/cli-pipeline.ts';
 
 /** Read source with CRLF normalized to LF: the parser's block-boundary and
@@ -341,6 +344,334 @@ export function stripComments(src: string): string {
   return out;
 }
 
+/**
+ * #8867 — blank git-argument and data-table literals before the flag scan.
+ *
+ * The flag scan is textual: every `--flag` literal in a command's modules
+ * becomes legal for that command. Two shapes are not gbrain flags at all:
+ *
+ *  1. Data tables — BEHAVIOR_CHANGES rows (changelog prose naming git
+ *     invocations, e.g. an uncommitted `git merge --squash`) and the
+ *     hardened-git allow-list tables (git's own per-subcommand options).
+ *     Their literals are data, never parsed by the command.
+ *  2. Git-spawn arguments — literals passed as argv to a git child process:
+ *     a direct spawn (`execFileSync('git', ['-C', root, 'status',
+ *     '--porcelain'])`), a same-file wrapper (bootstrap-checks' `g('status',
+ *     '--porcelain')`), an imported runner (hardenedGitSync), or a bare
+ *     `git([...])` call (every `git(...)` call in this repo is a git
+ *     invocation: sync-git.ts's `git`, effect-git.ts's `git`, withGit
+ *     callback params, frontmatter.ts's local wrapper). A `--porcelain`
+ *     there is git's flag, not the command's.
+ *
+ * The strip is AST-based (typescript is already a dependency): string
+ * contents are blanked with spaces, newlines preserved, so the flag scan
+ * sees nothing to collect and no other scan shifts lines. It runs on the
+ * raw source BEFORE stripComments — the comment stripper is a hand scanner
+ * that can desync on a regex literal containing backticks, and the AST
+ * parse of the true source is exact where the scanner is not.
+ *
+ * Known limits: argv held in a variable is only followed one hop within the
+ * same function (`const args = [...]; execFileSync('git', args, ...)` plus
+ * `args.push('--x')`, including conditional initializers); a variable built
+ * across functions, and a git runner reached through two or more import hops,
+ * still leak. A `--flag` inside a shell-script string (commit-guard.ts's hook
+ * script naming `git rev-parse --absolute-git-dir`) is prose, not a TS git
+ * call, so it also still leaks. And a flag another command genuinely consumes
+ * (orphans' `--count`, read by a module doctor imports) stays in the row:
+ * that is the generator's deliberate over-inclusion, not a git argument.
+ * None of these changes what the command itself parses.
+ */
+const DATA_TABLE_VARIABLES = new Set([
+  // Changelog prose: BEHAVIOR_CHANGES rows name git invocations in text.
+  'BEHAVIOR_CHANGES',
+  // hardened-git.ts: git's own per-subcommand option allow-lists.
+  'ALLOWED_OPTIONS',
+  'REQUIRED_OPTIONS',
+  'HISTORY_LOG_OPTIONS',
+  'REASON_LOG_OPTIONS',
+  'LOG_SHAPES',
+]);
+
+/** Child-process spawns that take the program as their first argument. */
+const SPAWN_CALLEES = new Set([
+  'execFileSync',
+  'execFile',
+  'spawnSync',
+  'spawn',
+  // Bounded-spawn helpers with the same (program, argv, options) shape.
+  'execFileBounded',
+  'tryExecAsync',
+  // promisify(execFile): sync-discovery.ts's syncGitAsync.
+  'execFileAsync',
+]);
+
+/** Cache of a module's same-file git-runner names, keyed by absolute path
+ * and validated against the file's current content (fixture trees are
+ * re-created per test run, so a bare path key would go stale). */
+const runnerCache = new Map<string, { content: string; runners: Set<string> }>();
+
+function blankSpans(src: string, spans: Array<[number, number]>): string {
+  if (!spans.length) return src;
+  const chars = src.split('');
+  for (const [start, end] of spans) {
+    for (let i = start; i < end && i < chars.length; i++) {
+      if (chars[i] !== '\n') chars[i] = ' ';
+    }
+  }
+  return chars.join('');
+}
+
+/** Blank every string literal's contents under `node` (quotes kept). */
+function blankStringsIn(spans: Array<[number, number]>, node: ts.Node): void {
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+    const start = node.getStart() + 1;
+    const end = node.getEnd() - 1;
+    if (end > start) spans.push([start, end]);
+    return;
+  }
+  if (ts.isTemplateExpression(node)) {
+    const head = node.head;
+    const hs = head.getStart() + 1;
+    const he = head.getEnd() - 2;
+    if (he > hs) spans.push([hs, he]);
+    for (const span of node.templateSpans) {
+      const lit = span.literal;
+      const ls = lit.getStart() + 1;
+      const le = lit.getEnd() - (ts.isTemplateTail(lit) ? 1 : 2);
+      if (le > ls) spans.push([ls, le]);
+      blankStringsIn(spans, span.expression);
+    }
+    return;
+  }
+  ts.forEachChild(node, child => blankStringsIn(spans, child));
+}
+
+/** Functions defined in one file, by name: named declarations plus
+ * variable-initialized function/arrow expressions. */
+function collectFnLikes(sf: ts.SourceFile): Map<string, ts.Node> {
+  const out = new Map<string, ts.Node>();
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      out.set(node.name.text, node);
+    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer
+      && (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))) {
+      out.set(node.name.text, node.initializer);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return out;
+}
+
+function isGitSpawnCall(node: ts.CallExpression): boolean {
+  const callee = node.expression;
+  if (!ts.isIdentifier(callee) || !SPAWN_CALLEES.has(callee.text)) return false;
+  const first = node.arguments[0];
+  return !!first && ts.isStringLiteral(first) && first.text === 'git';
+}
+
+/** True when `fn`'s body runs git directly or calls a known runner. */
+function fnEvidence(fn: ts.Node): { spawnsGit: boolean; callees: Set<string> } {
+  const callees = new Set<string>();
+  let spawnsGit = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      if (isGitSpawnCall(node)) spawnsGit = true;
+      const callee = node.expression;
+      if (ts.isIdentifier(callee)) callees.add(callee.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(fn);
+  return { spawnsGit, callees };
+}
+
+/**
+ * Same-file git runners, fixpointed from `seed`: a function that spawns git
+ * (`execFileSync('git', …)`) or calls a runner. `git` is always seeded — a
+ * bare `git(...)` call is a git invocation wherever it is bound. Each
+ * function's call evidence is computed once; the fixpoint is set
+ * intersection, not a re-walk (re-walking every body per iteration made the
+ * full registry build 3x slower).
+ */
+function collectRunnerNames(sf: ts.SourceFile, seed: Set<string>): Set<string> {
+  const runners = new Set(seed);
+  const fnLikes = collectFnLikes(sf);
+  const evidence = new Map<string, { spawnsGit: boolean; callees: Set<string> }>();
+  for (const [name, fn] of fnLikes) evidence.set(name, fnEvidence(fn));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [name, ev] of evidence) {
+      if (runners.has(name)) continue;
+      if (ev.spawnsGit || [...ev.callees].some(c => runners.has(c))) {
+        runners.add(name);
+        changed = true;
+      }
+    }
+  }
+  return runners;
+}
+
+/**
+ * Imported bindings that are git runners in their home module (one hop:
+ * `import { hardenedGitSync } from '../hardened-git.ts'`). The home module
+ * is analysed same-file only — a runner reached through two import hops is
+ * not followed (see the known limit above).
+ */
+function importedRunnerNames(sf: ts.SourceFile, filePath: string): Set<string> {
+  const out = new Set<string>();
+  const dir = dirname(filePath);
+  for (const stmt of sf.statements) {
+    if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+    const spec = stmt.moduleSpecifier.text;
+    if (!spec.startsWith('.')) continue;
+    const target = resolvePath(dir, spec);
+    if (!existsSync(target)) continue;
+    let content: string;
+    try {
+      content = readFileSync(target, 'utf-8');
+    } catch {
+      continue;
+    }
+    const cached = runnerCache.get(target);
+    let runners: Set<string>;
+    if (cached && cached.content === content) {
+      runners = cached.runners;
+    } else {
+      let targetSf: ts.SourceFile;
+      try {
+        targetSf = ts.createSourceFile(target, content, ts.ScriptTarget.Latest, true);
+      } catch {
+        continue;
+      }
+      runners = collectRunnerNames(targetSf, new Set(['git']));
+      runnerCache.set(target, { content, runners });
+    }
+    const bindings = stmt.importClause;
+    if (!bindings || !bindings.namedBindings || !ts.isNamedImports(bindings.namedBindings)) continue;
+    for (const el of bindings.namedBindings.elements) {
+      const imported = (el.propertyName ?? el.name).text;
+      if (runners.has(imported)) out.add(el.name.text);
+    }
+  }
+  return out;
+}
+
+/** True when `node` is a git call (direct spawn, bare `git(...)`, or a
+ * wrapper runner). Spawn calls additionally require the program to be the
+ * literal 'git' — `execFileBounded(cli.cmd, …)` is not one. */
+function isGitCall(node: ts.CallExpression, runners: Set<string>): boolean {
+  const callee = node.expression;
+  if (!ts.isIdentifier(callee)) return false;
+  if (SPAWN_CALLEES.has(callee.text)) return isGitSpawnCall(node);
+  return callee.text === 'git' || runners.has(callee.text);
+}
+
+export function stripNonFlagSpans(src: string, filePath?: string): string {
+  // Fast path: no `--` anywhere means no flag literal to blank (and no
+  // git-arg or table literal can carry one).
+  if (!src.includes('--')) return src;
+  let sf: ts.SourceFile;
+  try {
+    sf = ts.createSourceFile(filePath ?? 'module.ts', src, ts.ScriptTarget.Latest, true);
+  } catch {
+    return src;
+  }
+  const spans: Array<[number, number]> = [];
+  // Runners: bare `git`, imported runners, then same-file wrappers over them.
+  const seed = new Set<string>(['git']);
+  if (filePath) for (const name of importedRunnerNames(sf, filePath)) seed.add(name);
+  const runners = collectRunnerNames(sf, seed);
+
+  // Pass 1 — argv variables: identifiers handed to a git call as argv, and
+  // array-literal declarations, each tagged with its enclosing function so a
+  // same-named variable in another function is never blanked by mistake.
+  type FnTag = ts.Node | null;
+  const argvUses: Array<{ name: string; fn: FnTag }> = [];
+  // Array literals an argv variable is built from: a plain `const args =
+  // [...]` or a conditional (`const args = c ? [...] : [...]`, drift-watch).
+  const argvArraysIn = (node: ts.Node): ts.ArrayLiteralExpression[] => {
+    if (ts.isArrayLiteralExpression(node)) return [node];
+    if (ts.isConditionalExpression(node)) return [...argvArraysIn(node.whenTrue), ...argvArraysIn(node.whenFalse)];
+    if (ts.isParenthesizedExpression(node)) return argvArraysIn(node.expression);
+    return [];
+  };
+  const arrayDecls: Array<{ name: string; init: ts.ArrayLiteralExpression; fn: FnTag }> = [];
+  const fnStack: FnTag[] = [];
+  const pass1 = (node: ts.Node): void => {
+    const isFn = ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node);
+    if (isFn) fnStack.push(node);
+    if (ts.isCallExpression(node) && isGitCall(node, runners)) {
+      for (const arg of node.arguments) {
+        if (ts.isIdentifier(arg)) argvUses.push({ name: arg.text, fn: fnStack[fnStack.length - 1] ?? null });
+      }
+    }
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      for (const init of argvArraysIn(node.initializer)) {
+        arrayDecls.push({ name: node.name.text, init, fn: fnStack[fnStack.length - 1] ?? null });
+      }
+    }
+    ts.forEachChild(node, pass1);
+    if (isFn) fnStack.pop();
+  };
+  pass1(sf);
+  // Blank an argv variable's initializer when the git call that used it can
+  // see the declaration (same function, or a top-level declaration).
+  for (const use of argvUses) {
+    for (const decl of arrayDecls) {
+      if (decl.name === use.name && (decl.fn === null || decl.fn === use.fn)) {
+        blankStringsIn(spans, decl.init);
+      }
+    }
+  }
+
+  // Pass 2 — blank git argv and data tables.
+  const pass2 = (node: ts.Node): void => {
+    const isFn = ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node);
+    if (isFn) fnStack.push(node);
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)
+      && DATA_TABLE_VARIABLES.has(node.name.text) && node.initializer) {
+      // The whole initializer is data (prose / git options), never a flag
+      // this command parses. Do not recurse into it.
+      spans.push([node.initializer.getStart(), node.initializer.getEnd()]);
+    } else if (ts.isArrayLiteralExpression(node) && node.elements.length > 0
+      && ts.isStringLiteral(node.elements[0]) && node.elements[0].text === 'git') {
+      // A generic runner's argv: `runner(['git', '-C', root, 'status', …])`.
+      blankStringsIn(spans, node);
+    } else if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      if (isGitCall(node, runners)) {
+        for (const arg of node.arguments) {
+          if (ts.isArrayLiteralExpression(arg) || ts.isStringLiteral(arg)
+            || ts.isNoSubstitutionTemplateLiteral(arg) || ts.isTemplateExpression(arg)) {
+            blankStringsIn(spans, arg);
+          }
+        }
+      } else if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'push'
+        && ts.isIdentifier(callee.expression)
+        && argvUses.some(u => u.name === callee.expression.text
+          && (u.fn === (fnStack[fnStack.length - 1] ?? null)))) {
+        // `args.push('--untracked-files=no')` builds the argv of a git call
+        // in the same function.
+        for (const arg of node.arguments) {
+          if (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg) || ts.isTemplateExpression(arg)) {
+            blankStringsIn(spans, arg);
+          }
+        }
+      }
+    }
+    if (!(ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)
+      && DATA_TABLE_VARIABLES.has(node.name.text) && node.initializer)) {
+      ts.forEachChild(node, pass2);
+    }
+    if (isFn) fnStack.pop();
+  };
+  // Reuse the stack (empty after pass 1).
+  pass2(sf);
+  return blankSpans(src, spans);
+}
+
 export function segmentDispatchBlocks(fnSrc: string): Map<string, string> {
   const markRe = /(?:^[ \t]*if \(\s*command === '([a-z0-9-]+)'|^      case '([a-z0-9-]+)':)/gm;
   const marks: Array<{ label: string; start: number }> = [];
@@ -408,7 +739,10 @@ function buildFlagArtifacts(root: string): { registry: Record<string, string[]>;
   for (const record of records) {
     const mod = record.loadSpecifier ? readCommandModule(root, record.loadSpecifier) : null;
     // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- mod.path comes from the repo's own command table literal import specifiers; build-time only
-    if (mod) addBlock(record.name, stripComments(readSrc(join(root, mod.path))), dirname(join(root, mod.path)));
+    if (mod) {
+      const modPath = join(root, mod.path);
+      addBlock(record.name, stripComments(stripNonFlagSpans(readSrc(modPath), modPath)), dirname(modPath));
+    }
   }
 
   // Safety flags carry destructive-bypass semantics: allowlisting one that
@@ -474,11 +808,11 @@ function buildFlagArtifacts(root: string): { registry: Record<string, string[]>;
         // parses the moment the command imported one function from it.
         // Consumed flags are always string literals, so stripping can only
         // remove phantoms.
-        const sfCode = stripComments(sfSrc);
+        const sfCode = stripComments(stripNonFlagSpans(sfSrc, sfPath));
         depthZeroText += sfCode;
         for (const f of flagsInText(sfCode)) { flags.add(f); depthZero.add(f); }
         for (const dep of relativeImports(sfSrc, dirname(sfPath))) {
-          for (const f of flagsInText(stripComments(readSrc(dep)))) flags.add(f);
+          for (const f of flagsInText(stripComments(stripNonFlagSpans(readSrc(dep), dep)))) flags.add(f);
         }
       }
     }
@@ -487,7 +821,7 @@ function buildFlagArtifacts(root: string): { registry: Record<string, string[]>;
       // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- build-time generator over this repository's own source tree; every joined segment is a constant module path from DELEGATED_MODULES
       const path = join(root, rel);
       if (!existsSync(path)) continue;
-      const code = stripComments(readSrc(path));
+      const code = stripComments(stripNonFlagSpans(readSrc(path), path));
       depthZeroText += code;
       for (const f of flagsInText(code)) { flags.add(f); depthZero.add(f); }
     }

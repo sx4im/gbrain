@@ -51,12 +51,29 @@ const FILES: Record<string, string> = {
     '',
   ].join('\n'),
   'src/commands/synthetic-example.ts': [
+    "import { execFileSync } from 'node:child_process';",
+    '',
     'export async function runSyntheticExample(args: string[], connect: () => Promise<never>): Promise<void> {',
     "  if (args.includes('--help')) {",
     "    console.log('Usage: gbrain synthetic-example [--frobnicate]');",
     '    return;',
     '  }',
+    "  if (args.includes('--probe-git')) probeGitStatus('.');",
     "  if (args.includes('--frobnicate')) await connect();",
+    '}',
+    '',
+    '// #8867 fixture: a git spawn, a same-file git wrapper, and a changelog-style',
+    '// data table whose prose names git flags. None of these literals is a flag',
+    '// this command parses, so none may land in its registry row — while',
+    '// --frobnicate (consumed above) and --probe-git stay legal.',
+    "const BEHAVIOR_CHANGES = [{ since: '0.1', text: 'an uncommitted git merge --squash names --squash' }];",
+    '',
+    "const g = (...a: string[]): string => execFileSync('git', ['-C', '.', ...a], { encoding: 'utf8' }).toString();",
+    '',
+    'function probeGitStatus(root: string): void {',
+    "  execFileSync('git', ['-C', root, 'status', '--porcelain'], { stdio: 'ignore' });",
+    "  g('rev-parse', '--show-toplevel');",
+    '  void BEHAVIOR_CHANGES;',
     '}',
     '',
   ].join('\n'),
@@ -85,6 +102,19 @@ describe('synthetic command registered through the table', () => {
     expect(findUnknownFlag(['legacy', '--legacy-mode'], legal)).toBeNull();
     expect(findUnknownFlag(['--frobnicate', '--definitely-not-a-flag'], legal)).toBe('--definitely-not-a-flag');
     expect(findUnknownFlag(['--help'], legal)).toBeNull();
+  });
+
+  test('#8867: git argv and data-table prose do not legalise flags', () => {
+    const legal = new Set(buildFlagRegistry(root)['synthetic-example']);
+    // --probe-git is consumed (it calls the helper); the helper's git
+    // literals are not flags this command parses.
+    expect(legal.has('--probe-git')).toBe(true);
+    expect(findUnknownFlag(['--probe-git'], legal)).toBeNull();
+    expect(legal.has('--porcelain')).toBe(false);
+    expect(legal.has('--show-toplevel')).toBe(false);
+    expect(legal.has('--squash')).toBe(false);
+    expect(findUnknownFlag(['--porcelain'], legal)).toBe('--porcelain');
+    expect(findUnknownFlag(['--squash'], legal)).toBe('--squash');
   });
 
   test('its module answers --help without connecting an engine', async () => {

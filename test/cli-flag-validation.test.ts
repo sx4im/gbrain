@@ -239,6 +239,27 @@ describe('#2185 red-team regressions', () => {
     expect(CLI_FLAG_REGISTRY['backfill']).toContain('--dry-run');
   });
 
+  test('git arguments and changelog prose are not doctor/init flags (#8867)', () => {
+    // scripts/generate-flag-registry.ts used to collect every `--flag`
+    // literal, so `doctor` (and `init`, which imports the same modules)
+    // accepted flags it never reads: `--squash` from the BEHAVIOR_CHANGES
+    // row text, `--porcelain`/`--show-toplevel`/`--verify`/`--is-ancestor`
+    // from git spawns and their wrappers. The generator now blanks data
+    // tables and git argv before the scan.
+    expect(validateCommandFlags('doctor', ['--squash'])).toBe('--squash');
+    expect(validateCommandFlags('init', ['--squash'])).toBe('--squash');
+    expect(validateCommandFlags('doctor', ['--porcelain'])).toBe('--porcelain');
+    expect(validateCommandFlags('doctor', ['--show-toplevel'])).toBe('--show-toplevel');
+    expect(validateCommandFlags('doctor', ['--verify'])).toBe('--verify');
+    expect(validateCommandFlags('doctor', ['--is-ancestor'])).toBe('--is-ancestor');
+    expect(validateCommandFlags('doctor', ['--untracked-files'])).toBe('--untracked-files');
+    expect(CLI_FLAG_REGISTRY['doctor']).not.toContain('--squash');
+    expect(CLI_FLAG_REGISTRY['init']).not.toContain('--squash');
+    // Positive controls: flags the handlers genuinely parse stay legal.
+    expect(validateCommandFlags('doctor', ['--fix', '--fast', '--json'])).toBeNull();
+    expect(validateCommandFlags('init', ['--pglite', '--no-embedding'])).toBeNull();
+  });
+
   test('the internal run-child argv builder does not legalise its flags for importers', () => {
     // autopilot imports job-isolation.ts only to resolve the child CLI; the
     // module's `jobs run-child --job-id N [--allow-shell-jobs]` literals are
