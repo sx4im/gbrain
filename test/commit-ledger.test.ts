@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LEDGER_ROTATE_BYTES, ledgerFiles, messageDigest, readLedger, recordCommit, recordIntent } from '../src/core/git/commit-ledger.ts';
+import { LEDGER_ROTATE_BYTES, ledgerFiles, ledgerLocation, messageDigest, readLedger, recordCommit, recordIntent, resetLedgerCacheForTests } from '../src/core/git/commit-ledger.ts';
 import { commitPathsLocked } from '../src/core/git/commit-push.ts';
 
 const dir = mkdtempSync(join(tmpdir(), 'gbrain-commit-ledger-'));
@@ -95,6 +95,27 @@ test('commit-push records an intent with head_before and the message digest, the
 test('messageDigest applies git whitespace cleanup', () => {
   expect(messageDigest('subject  \n\n\n\nbody\n\n')).toBe(messageDigest('subject\n\nbody'));
   expect(messageDigest('a')).not.toBe(messageDigest('b'));
+});
+
+test('GST-8870: a failed location lookup is not cached — a directory that becomes a repo resolves on retry', () => {
+  const root = join(dir, `late-repo-${n++}`);
+  mkdirSync(root);
+  resetLedgerCacheForTests();
+  expect(ledgerLocation(root)).toBeNull();
+  git(root, ['init', '-q', '-b', 'main']);
+  const loc = ledgerLocation(root);
+  expect(loc).not.toBeNull();
+  expect(loc!.gitDir).toBe(join(root, '.git'));
+  expect(loc!.common).toBe(join(root, '.git'));
+});
+
+test('GST-8870: a successful location lookup stays cached', () => {
+  const root = repo();
+  resetLedgerCacheForTests();
+  const first = ledgerLocation(root);
+  expect(first).not.toBeNull();
+  rmSync(join(root, '.git'), { recursive: true, force: true });
+  expect(ledgerLocation(root)).toEqual(first);
 });
 
 test('GST-1623: a ledger that exists but cannot be read throws instead of reading as empty; a missing one is empty', () => {

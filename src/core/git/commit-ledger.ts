@@ -59,7 +59,9 @@ export function ledgerLocation(root: string): Location | null {
       found = { gitDir, common, worktree };
     }
   } catch { found = null; }
-  locations.set(key, found);
+  // Cache only successes: a failed lookup (transient git error, or a directory that is not a repo yet) must be
+  // re-probed on the next call instead of pinning the failure for the life of the process (#8870).
+  if (found) locations.set(key, found);
   return found;
 }
 
