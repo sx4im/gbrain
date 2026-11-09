@@ -287,7 +287,7 @@ and note that it came from that email."*
 ## Sessions an agent launches
 
 An orchestrator that starts worker sessions on your account (`claude -p`,
-`codex exec`) writes each worker's first user turn itself, usually from a
+`claude --bg`, `codex exec`) writes each worker's first user turn itself, usually from a
 template. Those turns are not yours, but the transcript looks the same as one
 of your own sessions. Tell gbrain who wrote them with one environment variable
 on the worker's process:
@@ -303,13 +303,27 @@ on the worker's process:
 GBRAIN_SESSION_AGENT=fleet-worker claude -p "$(render-brief task-42)"
 ```
 
+For `claude --bg` the variable cannot go on the command line: the session runs
+in a spare the daemon pre-spawned, and the env of the `claude --bg` invocation
+never reaches it. Set it in the `env` block of the settings file the
+orchestrator passes:
+
+```json
+{ "env": { "GBRAIN_SESSION_AGENT": "fleet-worker" } }
+```
+
+```bash
+claude --bg --settings fleet-settings.json "$(render-brief task-42)"
+```
+
 `GBRAIN_HOOKS=0` turns off every gbrain hook, context injection included;
 `GBRAIN_SESSION_AGENT=off` turns off only saving.
 
 **Automatic detection.** With the variable unset, the hook treats a session
 as agent-launched when its harness process runs headless (`claude -p` or
 `--print`, `codex exec`) and another `claude` or `codex` process is one of
-its ancestors. Its claims are saved as agent `agent-launched`'s. A headless
+its ancestors, or when it is a `claude --bg` session (a daemon spare,
+`bg-spare`, with a `bg-pty-host` above it). Its claims are saved as agent `agent-launched`'s. A headless
 session you start yourself from a terminal is still yours. Detection reads the
 process table and can miss a launcher that detaches its workers, and it never
 fires for a launcher that is not itself claude or codex (a cron job, a script

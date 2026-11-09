@@ -16,8 +16,9 @@
  *   - anything else: agent `agent`, reported as `speaker_label_invalid`.
  * Unset: detection (`detectAgentLaunched`) — a headless harness process
  * (claude `-p`/`--print`, codex `exec`) with a claude or codex process
- * among its ancestors. Headless alone is not enough: the owner scripting
- * `claude -p` is still the owner.
+ * among its ancestors, or a `claude --bg` session (a daemon spare
+ * `bg-spare` with a `bg-pty-host` above it). Headless alone is not
+ * enough: the owner scripting `claude -p` is still the owner.
  *
  * Sidecar `<sessionId>.speaker.json` (0600, tmp+rename) beside the corpus
  * files, written BEFORE any corpus file of the session; the first record is
@@ -74,15 +75,34 @@ function headless(harness: 'claude' | 'codex', args: readonly string[]): boolean
 }
 
 /**
+ * True when the argv is a Claude Code daemon spare claimed by `claude --bg`:
+ * the session process (`claude bg-spare --bg-spare <claim sock>`) carries no
+ * headless flag and names no launcher, so the spare alone proves nothing.
+ */
+function bgSpare(args: readonly string[]): boolean {
+  return args.slice(1).some((a) => a === 'bg-spare' || a === '--bg-spare' || a.startsWith('--bg-spare='));
+}
+
+/** True when the argv is the pty host of a Claude Code background session. */
+function bgPtyHost(args: readonly string[]): boolean {
+  return args.slice(1).some((a) => a === 'bg-pty-host' || a === '--bg-pty-host' || a.startsWith('--bg-pty-host='));
+}
+
+/**
  * True when the nearest harness process in `ancestry` (nearest first) runs
- * headless and another claude or codex process sits above it.
+ * headless and another claude or codex process sits above it — or when it is
+ * a `claude --bg` session, a daemon spare with a `bg-pty-host` above it.
+ * The spare alone is not enough: only the spare-plus-pty-host shape counts,
+ * so an interactive session is never mistaken for a background worker.
  */
 export function detectAgentLaunched(ancestry: readonly AncestorProcess[]): boolean {
   const at = ancestry.findIndex((p) => harnessOfArgs(p.args) !== null);
   if (at < 0) return false;
   const harness = harnessOfArgs(ancestry[at].args)!;
-  if (!headless(harness, ancestry[at].args)) return false;
-  return ancestry.slice(at + 1).some((p) => harnessOfArgs(p.args) !== null);
+  const rest = ancestry.slice(at + 1);
+  if (headless(harness, ancestry[at].args)) return rest.some((p) => harnessOfArgs(p.args) !== null);
+  if (harness === 'claude' && bgSpare(ancestry[at].args)) return rest.some((p) => bgPtyHost(p.args));
+  return false;
 }
 
 function linuxParent(pid: number): AncestorProcess & { ppid: number } | null {

@@ -62,6 +62,8 @@ const io = { write: () => {} };
 const ORCH: AncestorProcess = { pid: 10, args: ['/usr/local/bin/claude'] };
 const WORKER: AncestorProcess = { pid: 20, args: ['/usr/local/bin/claude', '-p', 'brief'] };
 const SHELL: AncestorProcess = { pid: 15, args: ['/bin/bash', '-c', 'claude -p brief'] };
+const BG_SPARE: AncestorProcess = { pid: 30, args: ['/usr/local/bin/claude', 'bg-spare', '--bg-spare', '/tmp/cc-daemon-501/abc/spare/def.claim.sock'] };
+const BG_PTY_HOST: AncestorProcess = { pid: 31, args: ['/usr/local/bin/claude', 'bg-pty-host', '--bg-pty-host', 'x', '--', '/usr/local/bin/claude', '--bg-spare', 'y'] };
 
 describe('resolveSessionSpeaker', () => {
   test('the launcher env names the agent, opts out, or declares the owner', () => {
@@ -84,6 +86,16 @@ describe('resolveSessionSpeaker', () => {
       .toEqual({ kind: 'agent', principal: 'agent-launched', source: 'detected' });
     expect(resolveSessionSpeaker({ env: {}, ancestry: () => [WORKER] })).toEqual({ kind: 'owner' });
   });
+
+  test('detection covers claude --bg sessions: daemon spare plus bg-pty-host ancestor', () => {
+    expect(detectAgentLaunched([BG_SPARE, BG_PTY_HOST])).toBe(true);
+    expect(detectAgentLaunched([{ pid: 1, args: ['node', 'jest'] }, { pid: 2, args: ['/bin/zsh', '-c', 'npm test'] }, BG_SPARE, BG_PTY_HOST])).toBe(true);
+    expect(detectAgentLaunched([BG_SPARE, SHELL])).toBe(false);
+    expect(detectAgentLaunched([BG_SPARE, ORCH])).toBe(false);
+    expect(detectAgentLaunched([BG_SPARE])).toBe(false);
+    expect(resolveSessionSpeaker({ env: {}, ancestry: () => [BG_SPARE, BG_PTY_HOST] }))
+      .toEqual({ kind: 'agent', principal: 'agent-launched', source: 'detected' });
+  });
 });
 
 describe('hook banking with a session speaker', () => {
@@ -102,6 +114,14 @@ describe('hook banking with a session speaker', () => {
     writeConfig();
     const t = writeTurns([{ role: 'user', text: BRIEF }, { role: 'assistant', text: 'ok' }]);
     await runHook(['stop'], { ...io, transcriptRoot: t.root, env: {}, processAncestry: () => [WORKER, SHELL, ORCH],
+      stdin: JSON.stringify({ session_id: 's-agent', transcript_path: t.path }) });
+    expect(readSpeakerSidecar(corpus(), 's-agent')).toMatchObject({ principal: 'agent-launched', source: 'detected' });
+  });
+
+  test('stop: detection marks an unflagged claude --bg session (daemon spare plus bg-pty-host)', async () => {
+    writeConfig();
+    const t = writeTurns([{ role: 'user', text: BRIEF }, { role: 'assistant', text: 'ok' }]);
+    await runHook(['stop'], { ...io, transcriptRoot: t.root, env: {}, processAncestry: () => [BG_SPARE, BG_PTY_HOST],
       stdin: JSON.stringify({ session_id: 's-agent', transcript_path: t.path }) });
     expect(readSpeakerSidecar(corpus(), 's-agent')).toMatchObject({ principal: 'agent-launched', source: 'detected' });
   });
