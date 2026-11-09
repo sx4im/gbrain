@@ -58,8 +58,12 @@ export function ledgerLocation(root: string): Location | null {
       const worktree = bare === 'true' ? null : run(['rev-parse', '--show-toplevel'])[0] || null;
       found = { gitDir, common, worktree };
     }
+    // Only a lookup that ran to completion is cached: a git failure (timeout,
+    // lock, slow filesystem) leaves nothing behind, so the next call retries
+    // instead of treating the ledger as missing for the life of the process.
+    // A completed lookup that finds no repository still caches its null.
+    locations.set(key, found);
   } catch { found = null; }
-  locations.set(key, found);
   return found;
 }
 
