@@ -17,6 +17,9 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { OperationError } from '../src/core/ops/contract.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
+import { renderFactsTable } from '../src/core/facts-fence.ts';
+import { renderTakesFence } from '../src/core/takes-fence.ts';
+import { createSegmentedPage } from './helpers/segmented-page.ts';
 import { runRepairCommand } from '../src/commands/repair.ts';
 import { agentSessionFactsCheck } from '../src/commands/doctor/checks/agent-session-facts.ts';
 import { runWaveChecks } from '../src/commands/doctor/wave-checks.ts';
@@ -219,6 +222,39 @@ describe('gbrain repair agent-session-facts, unmanaged repo-less brain', () => {
     const applied = await repair(engine, applyArgs(preview));
     expect(applied.results[0].outcomes).toEqual({ changed_since_preview: 1 });
     expect((await attribution(engine, id)).attributed_to).toBe('user');
+  }, 120_000);
+
+  test('a segmented page that has not changed applies like any other page (#9027)', async () => {
+    const truth = `# Acme Example\n\n${renderFactsTable([
+      { rowNum: 1, claim: 'Acme Example ships on Fridays', kind: 'fact', confidence: 1, visibility: 'private', notability: 'medium', active: true },
+      { rowNum: 2, claim: 'Acme Example prefers terse status updates', kind: 'fact', confidence: 1, visibility: 'private', notability: 'medium', active: true },
+    ])}\n\n${renderTakesFence([
+      { rowNum: 1, claim: 'Acme Example ships on Fridays', kind: 'fact', holder: 'self', weight: 0.8, sinceDate: '2026-10-01', source: 'hook:writeback', active: true },
+    ])}\n`;
+    await createSegmentedPage(engine, { slug: ACME, truth });
+    const insertFenced = async (fact: string, rowNum: number) => Number((await engine.executeRaw<{ id: number }>(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, source, source_session, attributed_to, row_num, source_markdown_slug)
+        VALUES ('default', $1, $2, 'fact', 'private', 'hook:writeback', 'sess-sidecar', 'user', $3, $1) RETURNING id`,
+      [ACME, fact, rowNum]))[0]!.id);
+    const a = await insertFenced('Acme Example ships on Fridays', 1);
+    const b = await insertFenced('Acme Example prefers terse status updates', 2);
+    const [page] = await engine.executeRaw<{ id: number }>("SELECT id FROM pages WHERE slug=$1 AND source_id='default'", [ACME]);
+    const [takeRow] = await engine.executeRaw<{ id: number }>(`INSERT INTO takes (page_id, row_num, claim, kind, holder, weight, since_date, source, active, created_at)
+      VALUES ($1, 1, 'Acme Example ships on Fridays', 'fact', 'self', 0.8, '2026-10-01', 'hook:writeback', true, now()) RETURNING id`, [page!.id]);
+    await engine.executeRaw('UPDATE facts SET consolidated_into=$1, consolidated_at=now() WHERE id=ANY($2::bigint[])', [takeRow!.id, [a, b]]);
+    const before = await counts(engine);
+
+    const preview = await repair(engine, []);
+    expect(preview.results[0].residuals).toMatchObject({ evidenced: 2, takes_to_retire: 1 });
+    const applied = await repair(engine, applyArgs(preview));
+    expect(applied.results[0].outcomes).toEqual({ reattributed: 1, retired: 1 });
+    for (const id of [a, b]) {
+      const row = await attribution(engine, id);
+      expect(row.attributed_to).toBe('other');
+      expect(row.context).toContain(speakerContextNote('worker-a'));
+    }
+    expect(await takeActive(engine, Number(takeRow!.id))).toBe(false);
+    expect(await counts(engine)).toEqual(before);
   }, 120_000);
 });
 

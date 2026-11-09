@@ -31,7 +31,9 @@
  * page) in the page's `## Facts` fence by one revision-bound `put_page` per
  * page, so the canonical projection rewrites the row in place; database-only
  * rows by one maintenance request on a managed brain (one transaction on an
- * unmanaged brain). Then each `kind: fact`, `holder: self` take that is still
+ * unmanaged brain). A page stored in segments is read back whole first
+ * (#9027), so it applies like any other page; one over the single-string
+ * ceiling is left out of the preview as a residual instead. Then each `kind: fact`, `holder: self` take that is still
  * active and unresolved and whose every contributing fact (`consolidated_into`)
  * is now non-user is retired (`active = false`): struck in the page's takes
  * fence by a revision-bound `put_page` when the fence holds it, otherwise in
@@ -63,7 +65,7 @@ import { readSessionSource } from '../context/corpus-source.ts';
 import { parseCorpusTurns } from '../context/corpus-turns.ts';
 import { DETECTED_PRINCIPAL, readSpeakerSidecar, speakerContextNote } from '../context/session-speaker.ts';
 import { stripPastedContent } from '../transcripts/pasted-content.ts';
-import { isSegmentedPage } from '../page-body/page-shape.ts';
+import { materializedSnapshot, segmentedOverCeiling } from '../persistence/segmented-apply.ts';
 import { shellQuote } from '../shell-quote.ts';
 import { pruneDir } from '../sync.ts';
 import { CAPTURE_LANES, captureSessionId } from './captured-facts.ts';
@@ -362,7 +364,19 @@ export const agentSessionFactsRepair: RepairHandler = {
       const base = (row: { source_id: string; slug: string }) => ({ source_id: row.source_id, slug: row.slug, include_ambiguous: includeAmbiguous,
         scope: scope.source_ids, options: optionsKey });
       const approved = [...groupByPage(approvedFacts, row => ({ ...base(row), facts: [] }), 'facts'), ...groupByPage(takes, row => ({ ...base(row), takes: [] }), 'takes')];
-      if (approved.length) await saveApprovedSet(engine, { command: COMMAND, hash }, approved);
+      // #9027: a page stored in segments over the single-string ceiling cannot
+      // be rewritten whole, so it is not approved: the preview reports it as
+      // a residual instead of promising an apply that reports it changed.
+      // A segmented page under the ceiling is approved and the apply reads
+      // it back whole (materializedSnapshot in rewriteFencedFacts/retireTakes).
+      const writable: ApprovedPage[] = [];
+      let segmentedOverCeilingPages = 0;
+      for (const page of approved) {
+        const snapshot = await engine.readPageSnapshot(page.slug, { sourceId: page.source_id });
+        if (snapshot && segmentedOverCeiling(snapshot.page)) { segmentedOverCeilingPages++; continue; }
+        writable.push(page);
+      }
+      if (writable.length) await saveApprovedSet(engine, { command: COMMAND, hash }, writable);
       const count = (klass: AgentSessionFactClass) => candidates.filter(c => c.class === klass).length;
       const listing: RepairListing[] = candidates.map(c => ({ item: `${c.source_id}:${c.slug}#${c.id}`, class: c.class === 'excluded' ? c.reason : c.class,
         detail: `${c.reason}; session ${c.session}; ${c.evidence}; principal ${c.principal}` }));
@@ -370,9 +384,10 @@ export const agentSessionFactsRepair: RepairHandler = {
         detail: `row ${take.row_num}; contributing facts ${take.fact_ids.join(', ')}` });
       for (const path of unreadable_corpus_files) listing.push({ item: path, class: 'unreadable_corpus_file',
         detail: 'not read (check its permissions); facts of its sessions are counted unclassifiable and kept' });
-      return { items: approved.map((page, i) => pageItem(page, hash, i, i === approved.length - 1, options)), preview_hash: hash, listing,
+      return { items: writable.map((page, i) => pageItem(page, hash, i, i === writable.length - 1, options)), preview_hash: hash, listing,
         residuals: { evidenced: count('evidenced'), ambiguous: count('ambiguous'), excluded: count('excluded'), unclassifiable, not_suspect, takes_to_retire: takes.length,
-          ...(unreadable_corpus_files.length ? { unreadable_corpus_files: unreadable_corpus_files.length } : {}) } };
+          ...(unreadable_corpus_files.length ? { unreadable_corpus_files: unreadable_corpus_files.length } : {}),
+          ...(segmentedOverCeilingPages ? { segmented_over_ceiling_pages: segmentedOverCeilingPages } : {}) } };
     }
     if (!opts.expect) {
       throw new OperationError('invalid_params', `gbrain repair ${COMMAND} --apply re-attributes only the set a preview printed.`,
@@ -478,12 +493,15 @@ export async function prepareAgentSessionFactsWrite(engine: BrainEngine, row: Wr
 /**
  * Fenced facts: set `attributed_to: other` and append the note on each still-matching, still user-attributed active
  * fence row and publish the page once, bound to the revision read; the canonical projection rewrites the rows in
- * place. Returns the facts that now read back as `other`. A page stored in segments is not rewritten.
+ * place. Returns the facts that now read back as `other`. A page stored in segments is read back whole first
+ * (#9027), so it applies like any other page; one over the single-string ceiling is not rewritten.
  */
 async function rewriteFencedFacts(ctx: Parameters<RepairHandler['apply']>[0], item: RepairItem, page: ApprovedPage, facts: AgentSessionFactCandidate[]): Promise<number[]> {
   const engine = ctx.engine;
-  const snapshot = await engine.readPageSnapshot(page.slug, { sourceId: page.source_id });
-  if (!snapshot || isSegmentedPage(snapshot.page)) return [];
+  const raw = await engine.readPageSnapshot(page.slug, { sourceId: page.source_id });
+  if (!raw || segmentedOverCeiling(raw.page)) return [];
+  const snapshot = await materializedSnapshot(engine, raw);
+  if (!snapshot) return [];
   const rows = await engine.executeRaw<{ id: number | string; fact: string; row_num: number }>(
     'SELECT id, fact, row_num FROM facts WHERE source_id=$1 AND id=ANY($2::bigint[]) AND expired_at IS NULL', [page.source_id, facts.map(f => f.id)]);
   let body = snapshot.page.compiled_truth ?? '';
@@ -509,12 +527,13 @@ async function rewriteFencedFacts(ctx: Parameters<RepairHandler['apply']>[0], it
 /**
  * Takes: a take the page's takes fence holds (same row and claim, active) is struck there by one revision-bound
  * `put_page` (the projection sets `active = false`); the rest are retired in the database. A page stored in
- * segments is not rewritten. Returns the retired takes.
+ * segments is read back whole first (#9027); one over the single-string ceiling is not rewritten. Returns the retired takes.
  */
 async function retireTakes(ctx: Parameters<RepairHandler['apply']>[0], item: RepairItem, page: ApprovedPage, hash: string, takes: AgentSessionTake[]): Promise<number[]> {
   const engine = ctx.engine;
-  const snapshot = await engine.readPageSnapshot(page.slug, { sourceId: page.source_id });
-  if (snapshot && isSegmentedPage(snapshot.page)) return [];
+  const raw = await engine.readPageSnapshot(page.slug, { sourceId: page.source_id });
+  if (raw && segmentedOverCeiling(raw.page)) return [];
+  const snapshot = raw ? await materializedSnapshot(engine, raw) : null;
   const body = snapshot ? serializePageToMarkdown(snapshot.page, snapshot.tags) : '';
   const fence = parseTakesFence(body);
   const fenced = takes.filter(t => fence.takes.some(row => row.rowNum === t.row_num && row.claim.trim() === t.claim.trim() && row.active));
