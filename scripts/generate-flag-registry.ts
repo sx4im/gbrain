@@ -27,6 +27,11 @@
  * Output: src/core/cli-flag-registry.generated.ts (committed; freshness is
  * pinned by test/cli-flag-validation.test.ts the same way build:llms pins the
  * llms bundles). Regenerate: bun run build:flag-registry
+ * Check: bun run build:flag-registry --check — what `bun run regen:all
+ * --check` runs for this artifact; exits 1 when the committed file no longer
+ * matches a fresh generator run (#9019: the check used to run the generator's
+ * behavior tests, which never compare the committed file, so a stale
+ * registry passed the freshness gate).
  *
  * Hand-tuning lane: EXTRA_FLAGS below, for flags that live deeper than the
  * one-level scan (add with a comment naming the deep module).
@@ -551,8 +556,21 @@ ${render(routing)}
 if (import.meta.main) {
   const { registry, routing } = buildFlagArtifacts(ROOT);
   const outPath = join(ROOT, 'src/core/cli-flag-registry.generated.ts');
-  writeFileSync(outPath, renderRegistryModule(registry, routing));
-  const n = Object.keys(registry).length;
-  const total = Object.values(registry).reduce((a, v) => a + v.length, 0);
-  console.log(`wrote ${outPath} (${n} commands, ${total} flag entries)`);
+  const fresh = renderRegistryModule(registry, routing);
+  if (process.argv.includes('--check')) {
+    // Freshness check (regen:all's check for this artifact): compare the
+    // committed file against a fresh render, like build-error-codes.ts.
+    let current = '';
+    try { current = readFileSync(outPath, 'utf8'); } catch { /* missing */ }
+    if (current !== fresh) {
+      console.error('src/core/cli-flag-registry.generated.ts is stale. Run: bun run build:flag-registry');
+      process.exit(1);
+    }
+    console.log('cli-flag-registry.generated.ts: up to date');
+  } else {
+    writeFileSync(outPath, fresh);
+    const n = Object.keys(registry).length;
+    const total = Object.values(registry).reduce((a, v) => a + v.length, 0);
+    console.log(`wrote ${outPath} (${n} commands, ${total} flag entries)`);
+  }
 }
