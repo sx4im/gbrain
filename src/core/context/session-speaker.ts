@@ -18,6 +18,11 @@
  * (claude `-p`/`--print`, codex `exec`) with a claude or codex process
  * among its ancestors. Headless alone is not enough: the owner scripting
  * `claude -p` is still the owner.
+ * `claude --bg` sessions are NOT detected (#9028): the daemon pre-spawns
+ * the session process (`claude bg-spare`), so the launcher is never an
+ * ancestor and the invocation's environment never reaches the session.
+ * With the variable unset a `--bg` session is the owner's; the launcher
+ * must set it in the `env` block of the `--settings` file it passes.
  *
  * Sidecar `<sessionId>.speaker.json` (0600, tmp+rename) beside the corpus
  * files, written BEFORE any corpus file of the session; the first record is

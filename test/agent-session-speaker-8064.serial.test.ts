@@ -62,6 +62,11 @@ const io = { write: () => {} };
 const ORCH: AncestorProcess = { pid: 10, args: ['/usr/local/bin/claude'] };
 const WORKER: AncestorProcess = { pid: 20, args: ['/usr/local/bin/claude', '-p', 'brief'] };
 const SHELL: AncestorProcess = { pid: 15, args: ['/bin/bash', '-c', 'claude -p brief'] };
+// #9028: a `claude --bg` session runs in a daemon pre-spawned spare; the
+// orchestrator's own claude process is not an ancestor (bg-pty-host, ppid 1).
+const BG_SPARE: AncestorProcess = { pid: 80, args: ['/usr/local/bin/claude', 'bg-spare', '--bg-spare', '/tmp/cc-daemon-501/abc/spare/def.claim.sock'] };
+const BG_PTY_HOST: AncestorProcess = { pid: 1, args: ['/usr/local/bin/claude', 'bg-pty-host', '--bg-pty-host', 'xyz', '--', '/usr/local/bin/claude', '--bg-spare', '/tmp/cc-daemon-501/abc/spare/def.claim.sock'] };
+const BG_TOOL: AncestorProcess = { pid: 100, args: ['node', '/x/node_modules/.bin/jest', 'run-changed.js'] };
 
 describe('resolveSessionSpeaker', () => {
   test('the launcher env names the agent, opts out, or declares the owner', () => {
@@ -83,6 +88,17 @@ describe('resolveSessionSpeaker', () => {
     expect(resolveSessionSpeaker({ env: {}, ancestry: () => [WORKER, SHELL, ORCH] }))
       .toEqual({ kind: 'agent', principal: 'agent-launched', source: 'detected' });
     expect(resolveSessionSpeaker({ env: {}, ancestry: () => [WORKER] })).toEqual({ kind: 'owner' });
+  });
+
+  test('#9028: a claude --bg session is not detected — the launcher is never an ancestor', () => {
+    // The daemon pre-spawns the session process, so a `--bg` session's
+    // ancestry is identical whether an orchestrator or the owner launched
+    // it; detection cannot tell them apart and the session is the owner's
+    // unless the launcher sets the variable (e.g. the --settings env block).
+    expect(detectAgentLaunched([BG_TOOL, BG_SPARE, BG_PTY_HOST])).toBe(false);
+    expect(resolveSessionSpeaker({ env: {}, ancestry: () => [BG_SPARE, BG_PTY_HOST] })).toEqual({ kind: 'owner' });
+    expect(resolveSessionSpeaker({ env: { GBRAIN_SESSION_AGENT: 'fleet-worker' }, ancestry: () => [BG_SPARE, BG_PTY_HOST] }))
+      .toEqual({ kind: 'agent', principal: 'fleet-worker', source: 'env' });
   });
 });
 
@@ -110,6 +126,15 @@ describe('hook banking with a session speaker', () => {
     writeConfig();
     const t = writeTurns([{ role: 'user', text: 'I prefer dark mode in every editor, please set it up.' }, { role: 'assistant', text: 'ok' }]);
     await runHook(['stop'], { ...io, transcriptRoot: t.root, env: {}, processAncestry: () => [ORCH],
+      stdin: JSON.stringify({ session_id: 's-agent', transcript_path: t.path }) });
+    expect(files().some((f) => f.includes('.wb-'))).toBe(true);
+    expect(readSpeakerSidecar(corpus(), 's-agent')).toBeNull();
+  });
+
+  test('stop: a claude --bg session banks as the owner unless the variable is set (#9028)', async () => {
+    writeConfig();
+    const t = writeTurns([{ role: 'user', text: BRIEF }, { role: 'assistant', text: 'ok' }]);
+    await runHook(['stop'], { ...io, transcriptRoot: t.root, env: {}, processAncestry: () => [BG_TOOL, BG_SPARE, BG_PTY_HOST],
       stdin: JSON.stringify({ session_id: 's-agent', transcript_path: t.path }) });
     expect(files().some((f) => f.includes('.wb-'))).toBe(true);
     expect(readSpeakerSidecar(corpus(), 's-agent')).toBeNull();

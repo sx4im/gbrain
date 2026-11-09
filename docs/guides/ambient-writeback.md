@@ -303,6 +303,23 @@ on the worker's process:
 GBRAIN_SESSION_AGENT=fleet-worker claude -p "$(render-brief task-42)"
 ```
 
+A session started with `claude --bg` runs in a spare the Claude Code daemon
+pre-spawned, so the `claude --bg` invocation's own environment never reaches
+it. Put the variable in the `env` block of the `--settings` file the
+orchestrator passes instead:
+
+```json
+{
+  "env": {
+    "GBRAIN_SESSION_AGENT": "fleet-worker"
+  }
+}
+```
+
+```bash
+claude --bg --settings fleet-settings.json "$(render-brief task-42)"
+```
+
 `GBRAIN_HOOKS=0` turns off every gbrain hook, context injection included;
 `GBRAIN_SESSION_AGENT=off` turns off only saving.
 
@@ -313,8 +330,12 @@ its ancestors. Its claims are saved as agent `agent-launched`'s. A headless
 session you start yourself from a terminal is still yours. Detection reads the
 process table and can miss a launcher that detaches its workers, and it never
 fires for a launcher that is not itself claude or codex (a cron job, a script
-or a daemon running `claude -p`). For those the variable is the only signal,
-so set it in any launcher you control.
+or a daemon running `claude -p`). Sessions started with `claude --bg` run in
+a spare the daemon pre-spawned, so the launcher is not among the session's
+ancestors at all: with the variable unset a `--bg` session is treated as
+yours, even when an orchestrator launched it. For those the variable is the
+only signal, so set it in any launcher you control — for `--bg`, in the `env`
+block of the `--settings` file, above.
 
 The marker covers the Claude Code and Codex hook lanes and the facts they
 save. The OpenClaw context-engine lane and dream synthesis do not read it yet.
