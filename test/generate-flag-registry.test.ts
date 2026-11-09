@@ -18,7 +18,10 @@
  * refused; per-subcommand rows are a filed TODO, not this lane.
  */
 import { describe, test, expect } from 'bun:test';
-import { segmentDispatchBlocks, buildFlagRegistry, isValueOnlyImport, stripComments } from '../scripts/generate-flag-registry.ts';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { segmentDispatchBlocks, buildFlagRegistry, checkFlagRegistry, isValueOnlyImport, renderRegistryModule, stripComments } from '../scripts/generate-flag-registry.ts';
 import { CLI_FLAG_REGISTRY } from '../src/core/cli-flag-registry.generated.ts';
 import { validateCommandFlags } from '../src/cli/main.ts';
 
@@ -276,8 +279,7 @@ describe('committed registry — eval row rejection (union-by-design)', () => {
   });
 });
 
-describe('block-level module scan — only ./commands/*.ts handlers are command modules', () => {
-  test('isValueOnlyImport: a SCREAMING_CASE-only destructure borrows a value, not a handler', () => {
+describe('block-level module scan — only ./commands/*.ts handlers are command modules', () => {  test('isValueOnlyImport: a SCREAMING_CASE-only destructure borrows a value, not a handler', () => {
     const line = (head: string) => `${head}await import('./commands/agent-register.ts');`;
     const at = (block: string) => block.indexOf("import('");
     let b = `  if (isThinClient(cfg)) {\n    const { THIN_CLIENT_REGISTER_MESSAGE } = ${line('')}\n  }`;
@@ -325,5 +327,110 @@ describe('block-level module scan — only ./commands/*.ts handlers are command 
     expect(CLI_FLAG_REGISTRY.eval).not.toContain('--embeddings');
     // --judge-model is now a real LME_FLAGS entry (Phase D), no longer a phantom.
     expect(CLI_FLAG_REGISTRY.eval).toContain('--judge-model');
+  });
+});
+
+describe('generate-flag-registry --check — the check:regen-all freshness pin (#9019)', () => {
+  /**
+   * Minimal fixture tree for buildFlagRegistry(root), mirroring
+   * test/cli-synthetic-command.test.ts: one table-registered command whose
+   * module reads --frobnicate, plus a @cliPipelineStage branch that reads
+   * --legacy-mode. The committed registry file is the fresh render, as the
+   * repo would carry it.
+   */
+  const CHECK_FILES: Record<string, string> = {
+    'src/cli/main.ts': [
+      'async function handleCliOnly(command: string, args: string[]) {',
+      '  if (await routeCheckBeforeTable(command, args)) return;',
+      '  if (await dispatchPreConnectCommand(command, args)) return;',
+      '}',
+      '',
+      '/** @cliPipelineStage */',
+      'async function routeCheckBeforeTable(command: string, args: string[]): Promise<boolean> {',
+      "  if (command === 'check-example' && args[0] === 'legacy') {",
+      "    return args.includes('--legacy-mode');",
+      '  }',
+      '  return false;',
+      '}',
+      '',
+    ].join('\n'),
+    'src/cli/command-table.ts': [
+      'export const CLI_COMMANDS = [',
+      "  { name: 'check-example', phase: 'pre-connect', thinClient: 'none', load: () => import('./commands/check-example.ts') },",
+      '];',
+      '',
+    ].join('\n'),
+    'src/cli/commands/check-example.ts': [
+      'export async function run(args: string[], ctx: { connectEngine(): Promise<never> }): Promise<void> {',
+      "  const { runCheckExample } = await import('../../commands/check-example.ts');",
+      '  await runCheckExample(args, () => ctx.connectEngine());',
+      '}',
+      '',
+    ].join('\n'),
+    'src/commands/check-example.ts': [
+      'export async function runCheckExample(args: string[], connect: () => Promise<never>): Promise<void> {',
+      "  if (args.includes('--help')) {",
+      "    console.log('Usage: gbrain check-example [--frobnicate]');",
+      '    return;',
+      '  }',
+      "  if (args.includes('--frobnicate')) await connect();",
+      '}',
+      '',
+    ].join('\n'),
+  };
+
+  function makeCheckFixture(): string {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-flag-registry-check-'));
+    for (const [rel, text] of Object.entries(CHECK_FILES)) {
+      mkdirSync(dirname(join(root, rel)), { recursive: true });
+      writeFileSync(join(root, rel), text);
+    }
+    mkdirSync(join(root, 'src/core'), { recursive: true });
+    writeFileSync(
+      join(root, 'src/core/cli-flag-registry.generated.ts'),
+      renderRegistryModule(buildFlagRegistry(root)),
+    );
+    return root;
+  }
+
+  test('fresh when the committed file matches a fresh render', () => {
+    const root = makeCheckFixture();
+    try {
+      const result = checkFlagRegistry(root);
+      expect(result.fresh).toBe(true);
+      expect(result.diffs).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('stale, naming the command and the flag, when a flag literal lands without regenerating', () => {
+    const root = makeCheckFixture();
+    try {
+      // The #9019 shape: a new --flag literal in a module the generator
+      // scans, with the committed registry left untouched.
+      appendFileSync(
+        join(root, 'src/commands/check-example.ts'),
+        "\n// a flag the command now reads, registry not regenerated\nexport const PROBE = '--check-stale-flag';\n",
+      );
+      const result = checkFlagRegistry(root);
+      expect(result.fresh).toBe(false);
+      expect(result.diffs.join('\n')).toContain('check-example');
+      expect(result.diffs.join('\n')).toContain('+ --check-stale-flag');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('stale when the committed file is missing', () => {
+    const root = makeCheckFixture();
+    try {
+      rmSync(join(root, 'src/core/cli-flag-registry.generated.ts'));
+      const result = checkFlagRegistry(root);
+      expect(result.fresh).toBe(false);
+      expect(result.diffs.join('\n')).toContain('is missing');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
