@@ -6,13 +6,16 @@
  * ~/.claude/skills; Codex: ~/.agents/skills and CODEX_HOME/skills), and only
  * when that build indexed at least one skill, write the file-plane keys
  * (skill-resolver-config.ts) and the lane's hook (skill-resolver-hook.ts).
+ * When the harness follows a shared brain it also snapshots the followed
+ * catalog into <harness>-shared (skill-resolver-shared-snapshot.ts), rebuilt
+ * when its view_token moves and removed when the follow is gone.
  * Otherwise nothing is written and the result carries
  * skill_resolver_setup_incomplete with the scanned directories. A re-run with
  * a fresh catalog, the keys and the hook in place changes nothing. It ends
  * with a sample block and an "on; N skills; fresh" status line.
  *
- * Off: remove the hook, the keys, this harness's catalogs (user and project)
- * and, when no harness is left on, the session state and the lane log.
+ * Off: remove the hook, the keys, this harness's catalogs (user, shared and
+ * project) and, when no harness is left on, the session state and the lane log.
  * Returns null when there is nothing of the resolver's for this harness, so
  * an install that never turned it on gets no new output.
  *
@@ -23,13 +26,14 @@
 import { existsSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { claudeUserSkillsDir, codexConfigPath } from '../bootstrap/host-specs.ts';
-import { buildSkillIndex, catalogStatus, listCatalogs, removeSkillIndex } from '../skills/resolver/build.ts';
+import { buildSkillIndex, catalogStatus, listCatalogs, readReceipt, removeSkillIndex } from '../skills/resolver/build.ts';
 import { ResolverError } from '../skills/resolver/errors.ts';
-import { logsDir, sessionsDir, skillIndexRoot } from '../skills/resolver/paths.ts';
+import { catalogFile, logsDir, sessionsDir, skillIndexRoot } from '../skills/resolver/paths.ts';
 import { resolveSkills } from '../skills/resolver/resolve.ts';
 import { readDirSources } from '../skills/resolver/sources.ts';
 import { readResolverConfig, resolverHarnesses, setResolverHarness } from './skill-resolver-config.ts';
 import { inspectSkillResolverHook, removeSkillResolverHook, syncSkillResolverHook, type ResolverHarness, type ResolverHookPaths } from './skill-resolver-hook.ts';
+import { buildSharedSnapshot, findSharedFollow, readSharedSnapshotView, sharedCatalogName } from './skill-resolver-shared-snapshot.ts';
 
 export interface ResolverStep { step: 'catalog' | 'config' | 'hook' | 'state'; action: 'write' | 'keep' | 'remove' | 'skip'; detail: string }
 export interface ResolverSetupError { code: 'skill_resolver_setup_incomplete' | 'skill_resolver_config_unreadable'; message: string; scanned: string[] }
@@ -43,7 +47,7 @@ export interface ResolverSetupResult {
 }
 
 export const userCatalog = (harness: ResolverHarness) => `${harness}-user`;
-const isHarnessCatalog = (harness: ResolverHarness, name: string) => name === userCatalog(harness) || name.startsWith(`${harness}-project-`);
+const isHarnessCatalog = (harness: ResolverHarness, name: string) => name === userCatalog(harness) || name === sharedCatalogName(harness) || name.startsWith(`${harness}-project-`);
 
 /** The user-level skill directories a harness loads natively, whether or not they exist. */
 export function harnessSkillDirs(harness: ResolverHarness): string[] {
@@ -88,6 +92,47 @@ export async function syncSkillResolverSetup(opts: { harness: ResolverHarness; g
     }
     out.steps.push({ step: 'catalog', action: 'write', detail: `${skills} skills from ${dirs.join(', ')} into ${where}` });
   } else out.steps.push({ step: 'catalog', action: 'keep', detail: `${skills} skills from ${dirs.join(', ')} in ${where}` });
+
+  // A followed shared catalog: snapshot its entries out of the sync cache
+  // into `<harness>-shared`, so the lane ranks them per turn (#9077 option 1).
+  // The snapshot is keyed on the cache's view_token: a re-run rebuilds it
+  // only when the view moved (after a `sync_brain_skills` refresh), and a
+  // follow that is gone takes its orphaned snapshot with it.
+  const shared = sharedCatalogName(harness);
+  const sharedWhere = join(skillIndexRoot(home), shared);
+  const follow = findSharedFollow(home, harness);
+  if (follow) {
+    const snap = buildSharedSnapshot(follow);
+    const status = existsSync(catalogFile(home, shared, 'receipt.json')) ? await catalogStatus(shared, { home }) : null;
+    const viewMatches = readSharedSnapshotView(home, shared) === follow.view_token;
+    const sharedFresh = !!status?.fresh && viewMatches && (status.receipt?.skill_count ?? 0) > 0;
+    const sharedExists = (await readReceipt(home, shared)) !== null;
+    if (dryRun) {
+      if (snap.skills < 1) {
+        out.steps.push({ step: 'catalog', action: sharedExists ? 'remove' : 'skip',
+          detail: `the followed shared catalog has no usable skill; ${sharedWhere} would ${sharedExists ? 'be removed' : 'stay as it is'}` });
+      } else {
+        out.steps.push({ step: 'catalog', action: sharedFresh ? 'keep' : 'write', detail: `${snap.skills} shared skills from ${follow.brain_id} into ${sharedWhere}` });
+      }
+    } else if (!sharedFresh) {
+      if (snap.skills < 1) {
+        if (sharedExists) await removeSkillIndex(shared, { home });
+        out.steps.push({ step: 'catalog', action: 'skip',
+          detail: `the followed shared catalog has no usable skill; ${shared} was ${sharedExists ? 'removed' : 'not built'}` });
+      } else {
+        try {
+          await buildSkillIndex({ catalog: shared, fromJson: snap.text, fromJsonStdin: true, harness }, { home });
+          out.steps.push({ step: 'catalog', action: 'write', detail: `${snap.skills} shared skills from ${follow.brain_id} into ${sharedWhere}` });
+        } catch (e) {
+          out.steps.push({ step: 'catalog', action: 'skip',
+            detail: `the shared catalog build failed (${e instanceof ResolverError ? e.code : (e as Error).message}); the user catalog and the lane are unaffected` });
+        }
+      }
+    } else out.steps.push({ step: 'catalog', action: 'keep', detail: `${snap.skills} shared skills from ${follow.brain_id} in ${sharedWhere}` });
+  } else if (readSharedSnapshotView(home, shared) !== null) {
+    if (!dryRun) await removeSkillIndex(shared, { home });
+    out.steps.push({ step: 'catalog', action: 'remove', detail: `${sharedWhere} (no shared-skills follow; the snapshot is stale)` });
+  }
 
   const keys = setResolverHarness(cfg, harness, true, dryRun);
   out.steps.push({ step: 'config', action: keys.changed ? 'write' : 'keep', detail: `skills.resolver.enabled = true, skills.resolver.harnesses includes ${harness} in ${cfg.path}` });

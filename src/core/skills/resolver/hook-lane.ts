@@ -282,6 +282,13 @@ async function laneTurn(event: 'user-prompt' | 'session-start', harness: LaneHar
     if (project?.built) catalogs.push(project.name);
     else if (project && settings.autoRebuild) await scheduleBuild(home, project.name, ['skills', 'index', 'build', '--catalog', project.name, '--dir', project.dir, '--scope', 'project', '--harness', harness], spawnFn);
   }
+  // A followed shared catalog, snapshotted at setup time (#9077 option 1):
+  // it ranks alongside the user catalog and is never rebuilt here — setup
+  // owns it (the lane has no brain to read it from).
+  if (harness === 'claude-code' || harness === 'codex') {
+    const shared = `${harness}-shared`;
+    try { await stat(catalogFile(home, shared, 'receipt.json')); catalogs.push(shared); } catch { /* no followed shared catalog */ }
+  }
 
   const worker = ctl.worker;
   if (!worker || laneWorkerFailed()) return { outcome: 'error', code: 'skill_resolver_internal', catalogs };

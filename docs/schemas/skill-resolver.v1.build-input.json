@@ -44,6 +44,10 @@
         "path": {
           "type": "string"
         },
+        "load": {
+          "type": "string",
+          "description": "The fetch route for this skill (a shared catalog's get_skill call); rendered on the block line, never ranked."
+        },
         "eligible": {
           "type": "boolean",
           "description": "false: never indexed (recorded as skipped: ineligible)."

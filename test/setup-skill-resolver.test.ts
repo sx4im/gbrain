@@ -15,6 +15,7 @@
  * resolver is configured.
  */
 import { afterAll, describe, expect, setDefaultTimeout, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,6 +43,8 @@ function box(): Box {
   return { root, home, project, bin, env: {
     HOME: home, GBRAIN_HOME: home, PATH: '/usr/bin:/bin', CLAUDE_CONFIG_DIR: undefined, CODEX_HOME: undefined, XDG_CONFIG_HOME: undefined,
     GBRAIN_SKILL_LOADING: undefined, GBRAIN_HOOK_LANE: undefined, GBRAIN_AGENT_INSTRUCTIONS: undefined, DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined,
+    // Bun's transpile cache is ~20 MB per fresh HOME and would fill the 512 MB /tmp; share one cache instead.
+    BUN_INSTALL_CACHE_DIR: '/opt/bun-cache',
   } };
 }
 function skill(dir: string, name: string, description: string): void {
@@ -254,5 +257,129 @@ describe('doctor', () => {
     writeFileSync(configPath(b), '{ broken');
     const unreadable = (await doctor()).checks.find((c: any) => c.name === 'skill_resolver');
     expect(unreadable).toMatchObject({ status: 'warn', details: { code: 'skill_resolver_config_unreadable' } });
+  });
+});
+
+describe('setup claude-code --skill-loading resolve: followed shared catalog', () => {
+  const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+  /** A fabricated shared-skills follow: harness receipt + adapter cache. */
+  function followFixture(b: Box, viewToken = 'vt-1', extraSkills: { name: string; description: string; triggers?: string[] }[] = []) {
+    const root = join(b.root, 'shared-root');
+    const entries: Record<string, unknown> = {};
+    const add = (name: string, description: string, triggers: string[] = []) => {
+      const key = ['brain-1', 'src-1', '1', 'pack-1', name].map(encodeURIComponent).join('/');
+      const rev = '01900000-0000-7000-8000-000000000001';
+      const rel = `revisions/${sha(key)}/${sha(rev)}/skills/${name}/SKILL.md`;
+      const p = join(root, 'shared-skills', rel);
+      mkdirSync(join(p, '..'), { recursive: true });
+      writeFileSync(p, `---\nname: ${name}\ndescription: ${description}\n${triggers.length ? `triggers: [${triggers.map((t) => JSON.stringify(t)).join(', ')}]\n` : ''}---\nSteps.\n`);
+      entries[key] = { revision: rev, files: { [`skills/${name}/SKILL.md`]: rel } };
+    };
+    add('citation-fixer', 'Fix citations; fix broken citations; citation audit', ['citation audit']);
+    for (const s of extraSkills) add(s.name, s.description, s.triggers ?? []);
+    mkdirSync(join(root, 'shared-skills'), { recursive: true });
+    writeFileSync(join(root, 'shared-skills', 'receipt.json'), JSON.stringify({ installation_id: 'inst-1', enrollment_epoch: 3, status: 'joined' }));
+    writeFileSync(join(root, 'shared-skills', 'active.json'), JSON.stringify({ brain_id: 'brain-1', installation_id: 'inst-1', enrollment_epoch: 3, view_token: viewToken, skills: entries }));
+    mkdirSync(join(gb(b), 'bootstrap'), { recursive: true });
+    writeFileSync(join(gb(b), 'bootstrap', 'harness.json'), JSON.stringify({
+      harness_receipt_version: 1, created_at: new Date().toISOString(), created_by: 'gbrain', url: 'http://x', source_id: 's',
+      token: { name: 't', minted: true }, targets: [],
+      shared_skills: [{ host: 'claude-code', root, name: 'x', url: 'http://x', status: 'joined' }],
+    }));
+    return { root, setStatus: (status: string) => {
+      const receipt = JSON.parse(readFileSync(join(gb(b), 'bootstrap', 'harness.json'), 'utf8')) as { shared_skills: { status: string }[] };
+      receipt.shared_skills[0]!.status = status;
+      writeFileSync(join(gb(b), 'bootstrap', 'harness.json'), JSON.stringify(receipt));
+    } };
+  }
+  const resolve = (b: Box, text: string) => runCli(['skills', 'resolve', '--catalog', 'claude-code-user', '--catalog', 'claude-code-shared', '--text', text, '--json'], { env: b.env, cwd: b.project });
+  const sharedSource = (b: Box) => JSON.parse(read(join(gb(b), 'skill-index', 'claude-code-shared', 'source.json'))!);
+  const sharedReceipt = (b: Box) => JSON.parse(read(join(gb(b), 'skill-index', 'claude-code-shared', 'receipt.json'))!);
+  /** The resolver's own files only: Bun's module cache under ~/.bun also moves on a re-run and is not gbrain's writing. */
+  const resolverState = (b: Box) => ({
+    config: read(configPath(b)),
+    hook: read(HARNESS['claude-code'].hookFile(b)),
+    catalogs: catalogs(b).sort(),
+    userReceipt: read(join(gb(b), 'skill-index', 'claude-code-user', 'receipt.json')),
+    sharedReceipt: read(join(gb(b), 'skill-index', 'claude-code-shared', 'receipt.json')),
+    sharedSource: read(join(gb(b), 'skill-index', 'claude-code-shared', 'source.json')),
+  });
+
+  test('a followed shared catalog is snapshotted alongside the user catalog and ranks per turn', async () => {
+    const b = box();
+    skill(HARNESS['claude-code'].skills(b), 'deploy-widget', 'Deploy the widget service.');
+    followFixture(b);
+    const on = await setup(b, 'claude-code', ['--skill-loading', 'resolve']);
+    expect(on.exitCode, on.stderr).toBe(0);
+    expect(on.stdout).toContain('shared skills');
+    expect(catalogs(b).sort()).toEqual(['claude-code-shared', 'claude-code-user']);
+    expect(sharedSource(b).view_token).toBe('vt-1');
+    expect(sharedSource(b).skills[0].load).toContain('get_skill');
+    expect(sharedReceipt(b).catalog.source).toMatchObject({ kind: 'json', stdin: true });
+    const r = await resolve(b, 'fix the broken citations across my brain pages');
+    expect(r.exitCode, r.stderr).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.suggestions[0].id).toBe('citation-fixer');
+    expect(out.suggestions[0].load).toContain('get_skill qualified_id="skill:brain-1:src-1:1:pack-1:citation-fixer"');
+    expect(out.block).toContain('load: "get_skill');
+  });
+
+  test('idempotent: a re-run keeps both catalogs and writes nothing', async () => {
+    const b = box();
+    skill(HARNESS['claude-code'].skills(b), 'deploy-widget', 'Deploy the widget service.');
+    followFixture(b);
+    expect((await setup(b, 'claude-code', ['--skill-loading', 'resolve'])).exitCode).toBe(0);
+    const before = resolverState(b);
+    const again = await setup(b, 'claude-code', ['--skill-loading', 'resolve', '--json']);
+    expect(again.exitCode).toBe(0);
+    expect(again.doc.skill_resolver.steps.map((s: { action: string }) => s.action)).toEqual(['keep', 'keep', 'keep', 'keep']);
+    expect(resolverState(b)).toEqual(before);
+  });
+
+  test('a new view_token rebuilds the shared catalog with the new entries', async () => {
+    const b = box();
+    skill(HARNESS['claude-code'].skills(b), 'deploy-widget', 'Deploy the widget service.');
+    followFixture(b);
+    expect((await setup(b, 'claude-code', ['--skill-loading', 'resolve'])).exitCode).toBe(0);
+    followFixture(b, 'vt-2', [{ name: 'meeting-ingestion', description: 'Ingest a meeting transcript into decisions and action items', triggers: ['meeting transcript'] }]);
+    const again = await setup(b, 'claude-code', ['--skill-loading', 'resolve']);
+    expect(again.exitCode, again.stderr).toBe(0);
+    expect(sharedSource(b).view_token).toBe('vt-2');
+    expect(sharedSource(b).skills.map((s: { id: string }) => s.id).sort()).toEqual(['citation-fixer', 'meeting-ingestion']);
+    const r = await resolve(b, 'ingest the meeting transcript');
+    expect(JSON.parse(r.stdout).suggestions[0].id).toBe('meeting-ingestion');
+  });
+
+  test('when the follow is gone the orphaned snapshot is removed', async () => {
+    const b = box();
+    skill(HARNESS['claude-code'].skills(b), 'deploy-widget', 'Deploy the widget service.');
+    const f = followFixture(b);
+    expect((await setup(b, 'claude-code', ['--skill-loading', 'resolve'])).exitCode).toBe(0);
+    expect(catalogs(b).sort()).toEqual(['claude-code-shared', 'claude-code-user']);
+    f.setStatus('left');
+    const again = await setup(b, 'claude-code', ['--skill-loading', 'resolve']);
+    expect(again.exitCode, again.stderr).toBe(0);
+    expect(again.stdout).toContain('no shared-skills follow');
+    expect(catalogs(b)).toEqual(['claude-code-user']);
+  });
+
+  test('off removes the shared catalog too', async () => {
+    const b = box();
+    skill(HARNESS['claude-code'].skills(b), 'deploy-widget', 'Deploy the widget service.');
+    followFixture(b);
+    expect((await setup(b, 'claude-code', ['--skill-loading', 'resolve'])).exitCode).toBe(0);
+    expect((await setup(b, 'claude-code', ['--skill-loading', 'off'])).exitCode).toBe(0);
+    expect(catalogs(b)).toEqual([]);
+  });
+
+  test('dry-run lists the shared write and writes nothing', async () => {
+    const b = box();
+    skill(HARNESS['claude-code'].skills(b), 'deploy-widget', 'Deploy the widget service.');
+    followFixture(b);
+    const before = resolverState(b);
+    const dry = await setup(b, 'claude-code', ['--skill-loading', 'resolve', '--dry-run']);
+    expect(dry.exitCode).toBe(0);
+    expect(dry.stdout).toContain('would write resolver catalog: 1 shared skills from brain-1 into');
+    expect(resolverState(b)).toEqual(before);
   });
 });

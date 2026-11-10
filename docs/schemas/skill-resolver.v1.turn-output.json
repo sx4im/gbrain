@@ -88,6 +88,10 @@
           "type": "string",
           "description": "The SKILL.md path, when the catalog knows it."
         },
+        "load": {
+          "type": "string",
+          "description": "The fetch route for this skill, when the catalog names one (a followed shared skill's get_skill call with its qualified_id and revision)."
+        },
         "catalog": {
           "type": "string"
         }

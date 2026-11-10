@@ -42,6 +42,9 @@ export interface SkillRecord {
   routing: string[];
   body: string;
   path?: string;
+  /** The harness's fetch route for this skill (a shared catalog's `get_skill`
+   * call); rendered on the block line when present, never ranked. */
+  load?: string;
   namespace?: string;
 }
 
@@ -181,7 +184,7 @@ function invalid(message: string): ResolverError {
 const optStr = (v: unknown) => v === undefined || typeof v === 'string';
 const optStrList = (v: unknown) => v === undefined || (Array.isArray(v) && v.every(x => typeof x === 'string'));
 
-/** An adapter's catalog snapshot: `[{id, name, description, triggers?, routing?, body?, path?, eligible?}]` (or `{skills: [...]}`). */
+/** An adapter's catalog snapshot: `[{id, name, description, triggers?, routing?, body?, path?, load?, eligible?}]` (or `{skills: [...]}`). */
 export function readJsonSource(text: string): SourceRead {
   if (Buffer.byteLength(text, 'utf8') > JSON_SOURCE_CAP_BYTES) throw invalid('The JSON catalog is over 8 MB.');
   let parsed: unknown;
@@ -195,9 +198,9 @@ export function readJsonSource(text: string): SourceRead {
   list.forEach((e, i) => {
     const o = e as Record<string, unknown>;
     if (!o || typeof o !== 'object' || typeof o.id !== 'string' || !o.id.trim() || o.id.length > MAX_ID || typeof o.name !== 'string' || !o.name.trim()
-      || !optStr(o.description) || !optStr(o.body) || !optStr(o.path) || !optStrList(o.triggers) || !optStrList(o.routing)
+      || !optStr(o.description) || !optStr(o.body) || !optStr(o.path) || !optStr(o.load) || !optStrList(o.triggers) || !optStrList(o.routing)
       || (o.eligible !== undefined && typeof o.eligible !== 'boolean')) {
-      throw invalid(`Entry ${i} is not a valid skill: id and name are required strings (id at most ${MAX_ID} characters); description, body and path are strings; triggers and routing are string arrays; eligible is a boolean.`);
+      throw invalid(`Entry ${i} is not a valid skill: id and name are required strings (id at most ${MAX_ID} characters); description, body, path and load are strings; triggers and routing are string arrays; eligible is a boolean.`);
     }
     const id = o.id.trim();
     if (o.eligible === false) { skipped.push({ reason: 'ineligible', id }); return; }
@@ -206,7 +209,8 @@ export function readJsonSource(text: string): SourceRead {
     skills.push({ id, name: cut(cleanText(o.name), MAX_NAME), description: cut(cleanText(o.description ?? ''), MAX_DESCRIPTION),
       triggers: boundTriggers(((o.triggers as string[] | undefined) ?? []).map(cleanText).filter(Boolean)),
       routing: ((o.routing as string[] | undefined) ?? []).map(cleanText).filter(Boolean).slice(0, MAX_ROUTING_ROWS),
-      body: typeof o.body === 'string' ? boundBody(o.body) : '', ...(typeof o.path === 'string' && o.path ? { path: o.path } : {}) });
+      body: typeof o.body === 'string' ? boundBody(o.body) : '', ...(typeof o.path === 'string' && o.path ? { path: o.path } : {}),
+      ...(typeof o.load === 'string' && o.load ? { load: cut(cleanText(o.load), MAX_DESCRIPTION) } : {}) });
   });
   return { kind: 'json', skills, skipped, snapshot: text };
 }

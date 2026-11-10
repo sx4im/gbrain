@@ -1,9 +1,11 @@
 /**
  * The `<relevant_skills>` block a harness puts in front of the model. A
  * header line, one line per suggestion with its exact load selector (id),
- * its path where the harness loads by path (codex, openclaw, pi, cursor), the display
- * name and the summary, then one load line chosen by --harness (or
- * --load-hint). Summaries are quoted catalog text inside a block that labels
+ * its path where the harness loads by path (codex, openclaw, pi, cursor),
+ * its fetch route (`load:`, when the catalog names one — a shared skill's
+ * `get_skill` call), the display name and the summary, then one load line
+ * chosen by --harness (or --load-hint). Summaries are quoted catalog text
+ * inside a block that labels
  * them untrusted; names-only lines (project-scope catalogs, --names-only)
  * carry the id and name only. The user's text is never echoed. The block
  * is cut only at whole lines, to the 400-token cap and to what the
@@ -42,12 +44,13 @@ export function quoted(s: string): string {
   return JSON.stringify(s.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ')).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
 }
 
-export interface BlockLine { id: string; name: string; summary: string; path?: string; namesOnly: boolean }
+export interface BlockLine { id: string; name: string; summary: string; path?: string; load?: string; namesOnly: boolean }
 
 export function suggestionLine(s: BlockLine, harness: string | undefined): string {
   const path = s.path && harness && PATH_HARNESSES.has(harness) ? ` path: ${quoted(s.path)}` : '';
-  if (s.namesOnly) return `- id: ${quoted(s.id)} name: ${quoted(s.name)}${path}`;
-  return `- id: ${quoted(s.id)} name: ${quoted(s.name)}${path} summary: ${quoted(s.summary)}`;
+  const load = s.load ? ` load: ${quoted(s.load)}` : '';
+  if (s.namesOnly) return `- id: ${quoted(s.id)} name: ${quoted(s.name)}${path}${load}`;
+  return `- id: ${quoted(s.id)} name: ${quoted(s.name)}${path}${load} summary: ${quoted(s.summary)}`;
 }
 
 export function loadLine(harness: string | undefined, loadHint?: string): string {

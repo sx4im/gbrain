@@ -73,15 +73,22 @@ per-turn hook that puts the block in front of the model on every prompt:
    (Codex: `codex-user` from `~/.agents/skills` and `$CODEX_HOME/skills`).
    With no skill found it stops with `skill_resolver_setup_incomplete` and
    writes nothing else.
-2. It sets `skills.resolver.enabled` and `skills.resolver.harnesses` in
+2. When this harness follows a shared brain, it also snapshots the followed
+   catalog into `claude-code-shared` (Codex: `codex-shared`) from the
+   shared-skills sync cache, so the lane ranks the followed entries per turn.
+   Each line names its fetch route (`load:` — a `get_skill` call with the
+   entry's `qualified_id` and exact `revision`); the lane never reads the
+   brain. Setup rebuilds the snapshot when the cache's `view_token` moves
+   (after a shared-skills refresh) and removes it when the follow is gone.
+3. It sets `skills.resolver.enabled` and `skills.resolver.harnesses` in
    `~/.gbrain/config.json`. A brainless install stays brainless: the file
    holds no engine, so nothing reads it as a brain.
-3. It adds the lane's own hook: Claude Code gets UserPromptSubmit and
+4. It adds the lane's own hook: Claude Code gets UserPromptSubmit and
    SessionStart entries marked `skill-resolver-v1` in `~/.claude/settings.json`;
    Codex gets UserPromptSubmit and SessionStart groups in `hooks.json`
    (`--harness codex`), each trusted in `config.toml`. Both run through the
    existing hook launcher.
-4. It prints a sample block and `skill resolver: on; N skills; fresh`.
+5. It prints a sample block and `skill resolver: on; N skills; fresh`.
 
 `--dry-run` lists every write, and re-running changes nothing. A bare
 `gbrain setup <harness>` refreshes a lane that is on.
@@ -111,6 +118,11 @@ The lane always exits 0 and prints nothing when it cannot deliver:
   rebuild the same way, at most once a minute;
   `skills.resolver.auto_rebuild false` or `GBRAIN_SKILLS_NO_AUTOREBUILD=1`
   stops both.
+- **Followed shared skills (Claude Code, Codex):** the `<harness>-shared`
+  catalog ranks alongside the user catalog; its lines carry `load:` naming
+  the `get_skill` fetch. The snapshot is refreshed by re-running setup after
+  a shared-skills refresh (`gbrain bootstrap harness --refresh-skills`);
+  `--skill-loading off` removes it.
 - **Compaction:** a SessionStart with `source: compact` (Claude Code, and Codex
   0.165 and later) resets the session, so skills can be offered again. A Codex
   install from before gets the SessionStart group on its next setup run.

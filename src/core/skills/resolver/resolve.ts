@@ -61,7 +61,7 @@ export interface TurnInput {
   min_match_strength?: MatchStrength;
 }
 
-export interface Suggestion { id: string; name: string; score: number; summary: string; reason: string; match_strength: MatchStrength; path?: string; catalog: string }
+export interface Suggestion { id: string; name: string; score: number; summary: string; reason: string; match_strength: MatchStrength; path?: string; load?: string; catalog: string }
 export interface TurnError { code: string; message: string; fix: { suggestion: string; command?: string } }
 export interface TurnOutput {
   schema_version: 1;
@@ -351,7 +351,7 @@ async function resolveInner(input: ReturnType<typeof normalizeTurnInput>, opts: 
     const remaining = Math.max(0, budget - state.spent);
     const lines: BlockLine[] = picked.map(x => {
       const m = metaOf(x.c, x.doc);
-      return { id: m.id, name: m.name, summary: m.summary, ...(m.path ? { path: m.path } : {}), namesOnly: Boolean(opts.namesOnly) || loaded[x.c]!.receipt.catalog.hints === 'names_only' };
+      return { id: m.id, name: m.name, summary: m.summary, ...(m.path ? { path: m.path } : {}), ...(m.load ? { load: m.load } : {}), namesOnly: Boolean(opts.namesOnly) || loaded[x.c]!.receipt.catalog.hints === 'names_only' };
     });
     let r = renderBlock(lines, { harness: input.harness, loadHint: opts.loadHint, cap: Math.min(BLOCK_TOKEN_CAP, remaining) });
     const exhausted = budget === 0 || remaining === 0 || (picked.length > 0 && r.kept === 0 && remaining < BLOCK_TOKEN_CAP);
@@ -363,7 +363,7 @@ async function resolveInner(input: ReturnType<typeof normalizeTurnInput>, opts: 
       const namesOnly = lines.find(l => l.id === m.id)!.namesOnly;
       const fields = ranks[x.c]!.matchedFields(x.doc).fields;
       const match_strength = strengthOf(x);
-      return { id: m.id, name: m.name, score: round4(x.score), summary: namesOnly ? '' : m.summary, reason: x.explicit ? `named in the turn; ${reasonText(fields)}` : reasonText(fields), match_strength, ...(m.path ? { path: m.path } : {}), catalog: loaded[x.c]!.name };
+      return { id: m.id, name: m.name, score: round4(x.score), summary: namesOnly ? '' : m.summary, reason: x.explicit ? `named in the turn; ${reasonText(fields)}` : reasonText(fields), match_strength, ...(m.path ? { path: m.path } : {}), ...(m.load ? { load: m.load } : {}), catalog: loaded[x.c]!.name };
     });
     const out: TurnOutput = { ...base, budget_exhausted: exhausted, suggestions, block: r.block, block_tokens: r.tokens, deduped };
     let explain: Explain | undefined;

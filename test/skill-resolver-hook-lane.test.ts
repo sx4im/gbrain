@@ -14,6 +14,7 @@
  * lane off it prints and writes nothing.
  */
 import { afterAll, describe, expect, setDefaultTimeout, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -43,6 +44,8 @@ function box(): Box {
     HOME: home, GBRAIN_HOME: home, PATH: '/usr/bin:/bin', CLAUDE_CONFIG_DIR: undefined, CODEX_HOME: undefined, XDG_CONFIG_HOME: undefined,
     CLAUDE_PROJECT_DIR: undefined, GBRAIN_HOOKS: undefined, GBRAIN_HOOK_LANE: undefined, GBRAIN_SKILLS_NO_AUTOREBUILD: undefined,
     GBRAIN_TEST_SKILL_LANE_STALL: undefined, GBRAIN_TEST_SKILL_LANE_DEADLINE_MS: undefined, DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined,
+    // Bun's transpile cache is ~20 MB per fresh HOME and would fill the 512 MB /tmp; share one cache instead.
+    BUN_INSTALL_CACHE_DIR: '/opt/bun-cache',
   } };
 }
 
@@ -417,5 +420,59 @@ describe('skill-resolver lane: project catalog', () => {
     await hook(b, wired(b, 'claude-code'), { prompt: 'rotate the fixture files', session_id: 's' }, { ...WIDE, GBRAIN_SKILLS_NO_AUTOREBUILD: '1' });
     await Bun.sleep(1500);
     expect(readdirSync(join(b.home, '.gbrain', 'skill-index')).filter((n) => n.startsWith('claude-code-project-'))).toEqual([]);
+  });
+});
+
+describe('skill-resolver lane: followed shared catalog', () => {
+  const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+  /** A fabricated shared-skills follow: harness receipt + adapter cache. */
+  function followFixture(b: Box): void {
+    const root = join(b.root, 'shared-root');
+    const key = ['brain-1', 'src-1', '1', 'pack-1', 'citation-fixer'].map(encodeURIComponent).join('/');
+    const rev = '01900000-0000-7000-8000-000000000001';
+    const rel = `revisions/${sha(key)}/${sha(rev)}/skills/citation-fixer/SKILL.md`;
+    const p = join(root, 'shared-skills', rel);
+    mkdirSync(join(p, '..'), { recursive: true });
+    writeFileSync(p, '---\nname: citation-fixer\ndescription: Fix citations; fix broken citations; citation audit\ntriggers: ["citation audit"]\n---\nSteps.\n');
+    mkdirSync(join(root, 'shared-skills'), { recursive: true });
+    writeFileSync(join(root, 'shared-skills', 'receipt.json'), JSON.stringify({ installation_id: 'inst-1', enrollment_epoch: 3, status: 'joined' }));
+    writeFileSync(join(root, 'shared-skills', 'active.json'), JSON.stringify({
+      brain_id: 'brain-1', installation_id: 'inst-1', enrollment_epoch: 3, view_token: 'vt-1',
+      skills: { [key]: { revision: rev, files: { 'skills/citation-fixer/SKILL.md': rel } } },
+    }));
+    mkdirSync(join(b.home, '.gbrain', 'bootstrap'), { recursive: true });
+    writeFileSync(join(b.home, '.gbrain', 'bootstrap', 'harness.json'), JSON.stringify({
+      harness_receipt_version: 1, created_at: new Date().toISOString(), created_by: 'gbrain', url: 'http://x', source_id: 's',
+      token: { name: 't', minted: true }, targets: [],
+      shared_skills: [{ host: 'claude-code', root, name: 'x', url: 'http://x', status: 'joined' }],
+    }));
+  }
+
+  test('the lane ranks the snapshotted shared catalog alongside the user catalog, naming the get_skill fetch', async () => {
+    const b = box();
+    seedSkills(claudeSkills(b));
+    followFixture(b);
+    await setup(b, 'claude-code');
+    const cmd = wired(b, 'claude-code');
+    const r = await hook(b, cmd, { prompt: 'fix the broken citations across my brain pages', session_id: 'sess-shared' }, WIDE);
+    expect(r.exitCode).toBe(0);
+    const block = contextOf(r);
+    expect(block).toContain('- id: "citation-fixer" name: "citation-fixer"');
+    expect(block).toContain('load: "get_skill qualified_id=\\"skill:brain-1:src-1:1:pack-1:citation-fixer\\"');
+    expect(block).toContain(CLAUDE_LOAD);
+    expect(laneLog(b).at(-1).catalogs).toEqual(['claude-code-user', 'claude-code-shared']);
+    const user = await hook(b, cmd, { prompt: 'please deploy the widget to staging', session_id: 'sess-shared-2' }, WIDE);
+    expect(contextOf(user)).toContain('id: "deploy-widget"');
+  });
+
+  test('without a follow the lane ranks the user catalog alone', async () => {
+    const b = box();
+    seedSkills(claudeSkills(b));
+    await setup(b, 'claude-code');
+    const cmd = wired(b, 'claude-code');
+    const r = await hook(b, cmd, { prompt: 'please deploy the widget to staging', session_id: 'sess-alone' }, WIDE);
+    expect(r.exitCode).toBe(0);
+    expect(contextOf(r)).toContain('id: "deploy-widget"');
+    expect(laneLog(b).at(-1).catalogs).toEqual(['claude-code-user']);
   });
 });

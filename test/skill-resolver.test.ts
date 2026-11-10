@@ -36,7 +36,7 @@ const scratch: string[] = [];
 afterAll(() => { for (const d of scratch) rmSync(d, { recursive: true, force: true }); });
 function tmp(prefix = 'skres-'): string { const d = mkdtempSync(join(tmpdir(), prefix)); scratch.push(d); return d; }
 
-interface J { id: string; name: string; description?: string; triggers?: string[]; routing?: string[]; body?: string; path?: string; eligible?: boolean }
+interface J { id: string; name: string; description?: string; triggers?: string[]; routing?: string[]; body?: string; path?: string; load?: string; eligible?: boolean }
 async function jsonCatalog(home: string, catalog: string, skills: J[], extra: Record<string, unknown> = {}) {
   const f = join(tmp('skres-src-'), 'catalog.json');
   writeFileSync(f, JSON.stringify(skills));
@@ -446,6 +446,22 @@ describe('block', () => {
     const r = await resolveSkills({ message: 'weekly status reports', harness: 'codex' }, { home });
     const path = JSON.parse(/path: ("[^"]*")/.exec(r.output.block)![1]!) as string;
     expect(readFileSync(path, 'utf8')).toContain('Open the template');
+  });
+
+  test('a catalog entry with a fetch route renders load: on its line and carries it in the suggestion', async () => {
+    const home = tmp();
+    await jsonCatalog(home, 'shared', [
+      { id: 'citation-fixer', name: 'citation-fixer', description: 'Fix citations; fix broken citations; citation audit', triggers: ['citation audit'], load: 'get_skill qualified_id="skill:brain-1:src-1:1:pack-1:citation-fixer" revision="rev-1" schema_version=2' },
+      { id: 'gbrain:deploy', name: 'deploy', description: 'Ship a service to production after the tests pass' },
+    ]);
+    const r = await resolveSkills({ message: 'fix the broken citations', harness: 'claude-code' }, { home, catalogs: ['shared'] });
+    expect(r.output.suggestions[0]!.id).toBe('citation-fixer');
+    expect(r.output.suggestions[0]!.load).toBe('get_skill qualified_id="skill:brain-1:src-1:1:pack-1:citation-fixer" revision="rev-1" schema_version=2');
+    expect(r.output.block).toContain('load: "get_skill qualified_id=\\"skill:brain-1:src-1:1:pack-1:citation-fixer\\" revision=\\"rev-1\\" schema_version=2"');
+    const d = await resolveSkills({ message: 'deploy the service', harness: 'claude-code' }, { home, catalogs: ['shared'] });
+    expect(d.output.suggestions[0]!.id).toBe('gbrain:deploy');
+    expect(d.output.suggestions[0]!.load).toBeUndefined();
+    expect(d.output.block).not.toContain('load:');
   });
 
   test('injection and trigger-stuffing corpus: hints stay quoted data and the block stays one envelope', async () => {
