@@ -8,6 +8,7 @@
  *   skill-index/<catalog>/index.bin     the index (term dictionary + postings)
  *   skill-index/<catalog>/receipt.json  the build receipt (written last)
  *   skill-index/<catalog>/source.json   the --from-json snapshot
+ *   skill-index/<catalog>/shared-source.json  the followed-catalog view a <harness>-shared snapshot was built from
  *   skill-index/<catalog>/fingerprint.json  stat fingerprint of a --dir source
  *   skill-index/<catalog>/lock          the build lease
  *   skill-index/<catalog>/stale.stamp   a resolve saw a stale index

@@ -29,12 +29,15 @@
  * wirings of different homes never deliver two blocks. (Identical commands
  * are deduplicated by the harness itself.)
  *
- * Catalogs: <harness>-user (built by setup) and, for Claude Code, a second
- * catalog for the project's .claude/skills, keyed by a hash of the project
- * root, built out of the turn by a detached `gbrain skills index build` on
- * first sight and merged at rank time (names only: scope project). A stale
- * catalog is rebuilt the same way, at most once a minute per catalog, unless
- * skills.resolver.auto_rebuild is false or GBRAIN_SKILLS_NO_AUTOREBUILD=1.
+ * Catalogs: <harness>-user (built by setup), <harness>-shared (the followed
+ * shared catalog, snapshotted by setup or a sync_brain_skills refresh when
+ * the install follows a shared brain; ranked as-is, never rebuilt here) and,
+ * for Claude Code, a second catalog for the project's .claude/skills, keyed
+ * by a hash of the project root, built out of the turn by a detached
+ * `gbrain skills index build` on first sight and merged at rank time (names
+ * only: scope project). A stale catalog is rebuilt the same way, at most
+ * once a minute per catalog, unless skills.resolver.auto_rebuild is false
+ * or GBRAIN_SKILLS_NO_AUTOREBUILD=1.
  *
  * Turn settings: skills.resolver.top_k, min_match, pinned (sent as exclude)
  * and per_harness.<harness>.{top_k,min_match} (config.ts laneTurnSettings);
@@ -63,6 +66,7 @@ import { laneTurnSettings, type LaneTurnSettings } from './config.ts';
 import { appendDailyLog, LANE_LOG } from './daily-log.ts';
 import { assertCatalogName, catalogFile, logsDir, resolverHome } from './paths.ts';
 import { type CommitHold, commitSessionAsync, sessionKey, type TurnDelta } from './session.ts';
+import { sharedCatalogName } from './shared-snapshot.ts';
 import type { TurnOutput } from './resolve.ts';
 import type { LaneWorkerTurn } from './hook-worker.ts';
 import { laneWorkerFailed, startLaneWorker } from './lane-worker.ts';
@@ -277,6 +281,10 @@ async function laneTurn(event: 'user-prompt' | 'session-start', harness: LaneHar
   if (!prompt.trim() || /^\s*<(task-notification|teammate-message)[\s>]/.test(prompt)) return { outcome: 'empty' };
   const spawnFn = io.spawn ?? spawnDetached;
   const catalogs = [userCatalogName(harness)];
+  // GBRA-399 (#9077 option 1): rank the followed shared catalog alongside
+  // the user catalog when setup (or a sync) snapshotted one. The lane never
+  // judges its freshness; a missing receipt just means no follow.
+  try { await stat(catalogFile(home, sharedCatalogName(harness), 'receipt.json')); catalogs.push(sharedCatalogName(harness)); } catch { /* no shared snapshot */ }
   if (harness === 'claude-code') {
     const project = await projectCatalog(env.CLAUDE_PROJECT_DIR || cwd, home);
     if (project?.built) catalogs.push(project.name);

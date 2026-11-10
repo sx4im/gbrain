@@ -6,6 +6,8 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createSharedSkillsAdapter, type SharedSkillsToolCaller } from '../src/core/shared-skills/adapter.ts';
 import { sharedSkillKey, type MembershipSnapshot } from '../src/core/shared-skills/membership-types.ts';
+import { sharedCatalogName } from '../src/core/skills/resolver/shared-snapshot.ts';
+import { withEnv } from './helpers/with-env.ts';
 import { sha256 } from '../src/core/agent-install/state.ts';
 import { installHarnessConnection } from '../src/core/harness/install.ts';
 import type { HarnessCredentials } from '../src/core/harness/credentials.ts';
@@ -58,6 +60,25 @@ test('qualified revision cache refreshes body and helper without notifications a
   expect(statSync(join(root, updated.files['SKILL.md'])).mode & 0o111).toBe(0);
   expect(readFileSync(join(root, 'router/SKILL.md'), 'utf8')).toContain('team-brain');
   expect(readFileSync(join(root, 'router/SKILL.md'), 'utf8')).toContain('advisory, not an enforced invocation hook');
+});
+
+/** GBRA-399 (#9077 option 1): a successful sync snapshots the followed catalog for the resolver, and leaving removes it. */
+test('join snapshots the followed catalog for the skill resolver; leave removes it', async () => {
+  const f = fixture(), root = temp();
+  const home = temp();
+  const adapter = createSharedSkillsAdapter({ call: f.call, root, adapter: 'codex', connectionName: 'team-brain' });
+  await withEnv({ GBRAIN_HOME: home }, async () => {
+    await adapter.join({ approved: true });
+    const catalog = join(home, '.gbrain', 'skill-index', sharedCatalogName('codex'));
+    expect(existsSync(join(catalog, 'receipt.json'))).toBe(true);
+    const receipt = JSON.parse(readFileSync(join(catalog, 'receipt.json'), 'utf8'));
+    expect(receipt.catalog.skill_count).toBe(1);
+    const source = JSON.parse(readFileSync(join(catalog, 'source.json'), 'utf8'));
+    expect(source[0].id).toBe(`skill:${f.skill().brain_id}:default:${f.skill().source_incarnation}:example:fixture`);
+    expect(source[0].name).toBe('fixture');
+    await adapter.leave();
+    expect(existsSync(catalog)).toBe(false);
+  });
 });
 
 test('offline and partial enumeration block admission without deleting the prior authorized cache', async () => {

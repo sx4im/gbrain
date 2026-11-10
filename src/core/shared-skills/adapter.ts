@@ -5,6 +5,10 @@ import { acquireNativeLock } from '../persistence/native-lock.ts';
 import { OperationError, opError, type OpErrorOpts } from '../ops/contract.ts';
 import type { RegistryCode } from '../error-registry.ts';
 import { harnessAdapter } from '../harness/registry.ts';
+import { removeSkillIndex } from '../skills/resolver/build.ts';
+import { resolverHome } from '../skills/resolver/paths.ts';
+import { refreshSharedSnapshot, sharedCatalogName } from '../skills/resolver/shared-snapshot.ts';
+import { qualifiedSkillId } from './catalog.ts';
 import { installNativeRouter, prepareNativeRouter, recordedNativeSkillsDirectory, removeNativeRouter } from '../harness/native-router.ts';
 import { SHARED_SKILLS_DELIVERY_LIMITS, sharedSkillKey, type FollowPolicy, type MembershipSnapshot, type SharedSkillIdentity } from './membership-types.ts';
 
@@ -219,6 +223,27 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
       }
       else delete receipt.acknowledged_view;
       save(receipt);
+      // GBRA-399 (#9077 option 1): a successful sync re-snapshots the
+      // followed catalog for the skill resolver, so the lane ranks the
+      // current view. Best effort only: a snapshot failure never fails
+      // the sync (the router flow still works without it), and only the
+      // resolver harnesses (claude-code, codex) get a catalog. The sync
+      // view carries identities, not qualified ids: the adapter computes
+      // each entry's get_skill key with the canonical qualifiedSkillId
+      // (never built by hand anywhere else).
+      if (adapter.id === 'claude-code' || adapter.id === 'codex') {
+        try {
+          await refreshSharedSnapshot(resolverHome(), adapter.id, {
+            brain_id: snapshot.brain_id, view_token: snapshot.view_token,
+            skills: snapshot.skills.map(s => ({
+              qualified_id: qualifiedSkillId(s), name: s.name, description: s.description ?? '',
+              triggers: s.triggers ?? [],
+              usable: typeof s.usable === 'boolean' ? s.usable : undefined,
+              delivery: s.delivery === 'complete' || s.delivery === 'prose_only' ? s.delivery : undefined,
+            })),
+          });
+        } catch { /* the next setup re-run or sync retries the snapshot */ }
+      }
       return receipt;
     } catch (error) {
       const code = (error as { code?: string }).code;
@@ -291,6 +316,11 @@ export function createSharedSkillsAdapter(options: SharedSkillsAdapterOptions) {
       receipt.retained_files = retained;
       receipt.next_action = 'Disable native cached instructions and restart the harness. Retained edits were not removed; credentials remain independently valid.';
       save(receipt);
+      // GBRA-399: leaving ends the follow, so the resolver snapshot goes
+      // with it. Best effort only, like the sync refresh above.
+      if (adapter.id === 'claude-code' || adapter.id === 'codex') {
+        try { await removeSkillIndex(sharedCatalogName(adapter.id), { home: resolverHome() }); } catch { /* a stale snapshot is reaped by the next setup run */ }
+      }
       try {
         await options.call('leave_brain', { installation_id: receipt.installation_id, enrollment_epoch: receipt.enrollment_epoch });
         receipt.remote_membership_pending = false;

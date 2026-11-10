@@ -39,7 +39,7 @@ import { resolveGbrainBin } from '../core/gbrain-bin.ts';
 import { isRegistrationSurface, isValidName, REGISTRATION_SURFACE, registrationAdvertise, stdioServeArgv } from '../core/mcp-registration.ts';
 import { hookLauncherPath } from '../core/setup/hook-launcher.ts';
 import { readResolverConfig, resolverHarnesses } from '../core/setup/skill-resolver-config.ts';
-import { describeResolverSetup, removeSkillResolverSetup, syncSkillResolverSetup, type ResolverSetupResult } from '../core/setup/skill-resolver-setup.ts';
+import { describeResolverSetup, fetchSharedCatalogView, removeSkillResolverSetup, syncSkillResolverSetup, type ResolverSetupResult } from '../core/setup/skill-resolver-setup.ts';
 import { isValidSourceId } from '../core/source-id.ts';
 import { peekLock } from '../core/pglite-lock.ts';
 import { claudePluginProvidesName, codexPluginProvidesName } from '../core/bootstrap/plugin-lanes.ts';
@@ -817,7 +817,11 @@ async function resolverFor(harness: SetupHarnessId, flags: SetupFlags, launcher:
   if (flags.skillResolver === 'off' || (flags.remove && flags.skillResolver !== 'on')) return removeSkillResolverSetup({ harness, home, dryRun: flags.dryRun });
   const cfg = readResolverConfig(home);
   if (flags.skillResolver !== 'on' && !(cfg.state === 'ok' && resolverHarnesses(cfg.doc).includes(harness))) return null;
-  return syncSkillResolverSetup({ harness, gbrainBin: launcher, gbrainHome: process.env.GBRAIN_HOME?.trim() || undefined, home, dryRun: flags.dryRun });
+  // The followed catalog is snapshotted from the authorized view, read
+  // through the binary (setup stays engine-free); a brainless install
+  // reads no_brain and snapshots nothing.
+  return syncSkillResolverSetup({ harness, gbrainBin: launcher, gbrainHome: process.env.GBRAIN_HOME?.trim() || undefined, home, dryRun: flags.dryRun,
+    ...(launcher ? { sharedSkills: () => fetchSharedCatalogView(launcher) } : {}) });
 }
 
 function resolverRefusal(r: ResolverSetupResult): OperationError {
