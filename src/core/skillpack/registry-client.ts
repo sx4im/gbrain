@@ -72,7 +72,8 @@ export type RegistryClientErrorCode =
   | 'no_cache_no_network'
   | 'fetch_succeeded_but_schema_invalid'
   | 'cache_corrupt'
-  | 'url_invalid';
+  | 'url_invalid'
+  | 'registry_http_error';
 
 export class RegistryClientError extends Error {
   constructor(
@@ -222,7 +223,14 @@ export async function loadRegistry(opts: LoadRegistryOptions = {}): Promise<Load
       }
 
       if (!catalogRes.ok) {
-        throw new Error(`HTTP ${catalogRes.status} ${catalogRes.statusText}`);
+        // A non-2xx response is not a network outage: the URL answered and
+        // said no (e.g. the default registry is not published yet, HTTP 404).
+        // Throw a dedicated code naming the URL + status; the catch below
+        // falls back to cache when one exists and only hard-fails without it.
+        throw new RegistryClientError(
+          `registry at ${url} returned HTTP ${catalogRes.status} ${catalogRes.statusText}`,
+          'registry_http_error',
+        );
       }
 
       const catalogJson = await catalogRes.json();
@@ -267,7 +275,16 @@ export async function loadRegistry(opts: LoadRegistryOptions = {}): Promise<Load
       };
     } catch (err) {
       // Schema-invalid responses are a hard failure — don't degrade to cache.
-      if (err instanceof RegistryClientError) throw err;
+      if (err instanceof RegistryClientError && err.code === 'fetch_succeeded_but_schema_invalid') throw err;
+      // An HTTP error response is not a network outage: the URL answered and
+      // said no. Without a cache it fails with its own code that names the
+      // URL, the status, and the --url override — never "require network".
+      if (err instanceof RegistryClientError && err.code === 'registry_http_error' && !cached) {
+        throw new RegistryClientError(
+          `${err.message} and no on-disk cache exists. Use --url <registry-url> to try another registry, or 'gbrain skillpack registry --url <registry-url>' to save one (skillpack.registry_url).`,
+          'registry_http_error',
+        );
+      }
       // Network failure — fall through to cache.
       if (cached) {
         const ageMs = Date.now() - new Date(cached.fetched_at).getTime();

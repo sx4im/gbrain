@@ -4078,6 +4078,14 @@ More: [docs/guides/write-refusals.md#refresh_source_changed](../../docs/guides/w
 
 More: [docs/guides/write-refusals.md#refresh_sync_timeout](../../docs/guides/write-refusals.md#refresh_sync_timeout)
 
+### registry_http_error
+
+<a id="registry_http_error"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The skillpack registry URL returned a non-2xx HTTP response and no on-disk registry cache exists, so the registry could not be loaded. | The URL answered and said no (for example the default registry is not published yet and returns HTTP 404). This is not a network outage: the message names the URL and the status instead of saying the install requires network. | Point skillpack at a working registry with 'gbrain skillpack registry --url <registry-url>' (saved as skillpack.registry_url), or pass --url on the command, then run the command again. | agent | `gbrain doctor --json` | 1 | no |
+
 ### relay_disabled
 
 <a id="relay_disabled"></a>

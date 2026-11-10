@@ -565,6 +565,13 @@ async function cmdScrubLegacy(args: string[]): Promise<void> {
 // search / info / registry  (registry catalog reads)
 // ---------------------------------------------------------------------------
 
+/** Print a registry load failure with its code and the configured URL (exit 2). */
+function printRegistryLoadError(err: Error & { code?: string }, url: string): void {
+  if (err.code) console.error(`Error [${err.code}]: ${err.message}`);
+  else console.error(`Error: ${err.message}`);
+  console.error(`Currently configured registry: ${url}`);
+}
+
 async function cmdSearch(args: string[]): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) {
     console.log(
@@ -590,8 +597,21 @@ async function cmdSearch(args: string[]): Promise<void> {
     }
   }
 
-  const { loadRegistry, searchPacks } = await import('../core/skillpack/registry-client.ts');
-  const loaded = await loadRegistry({ url: urlOverride, refresh });
+  const { loadRegistry, searchPacks, resolveRegistryUrl, RegistryClientError } = await import(
+    '../core/skillpack/registry-client.ts'
+  );
+  // A registry load failure is a caller-facing error with its own code
+  // (e.g. registry_http_error), not an internal_error with a doctor fix.
+  let loaded: Awaited<ReturnType<typeof loadRegistry>>;
+  try {
+    loaded = await loadRegistry({ url: urlOverride, refresh });
+  } catch (err) {
+    if (err instanceof RegistryClientError) {
+      printRegistryLoadError(err, resolveRegistryUrl({ url: urlOverride }));
+      process.exit(2);
+    }
+    throw err;
+  }
   const results = searchPacks(loaded, { query, tier });
 
   if (json) {
@@ -660,8 +680,21 @@ async function cmdInfo(args: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const { loadRegistry, findPackWithTier } = await import('../core/skillpack/registry-client.ts');
-  const loaded = await loadRegistry({ url: urlOverride, refresh });
+  const { loadRegistry, findPackWithTier, resolveRegistryUrl, RegistryClientError } = await import(
+    '../core/skillpack/registry-client.ts'
+  );
+  // A registry load failure is a caller-facing error with its own code
+  // (e.g. registry_http_error), not an internal_error with a doctor fix.
+  let loaded: Awaited<ReturnType<typeof loadRegistry>>;
+  try {
+    loaded = await loadRegistry({ url: urlOverride, refresh });
+  } catch (err) {
+    if (err instanceof RegistryClientError) {
+      printRegistryLoadError(err, resolveRegistryUrl({ url: urlOverride }));
+      process.exit(2);
+    }
+    throw err;
+  }
   const found = findPackWithTier(loaded, name);
   if (!found) {
     console.error(`Error: no skillpack named "${name}" in ${loaded.registry_url}.`);
@@ -785,8 +818,7 @@ async function cmdRegistry(args: string[]): Promise<void> {
     }
     process.exit(0);
   } catch (err) {
-    console.error(`Error: ${(err as Error).message}`);
-    console.error(`Currently configured registry: ${url}`);
+    printRegistryLoadError(err as Error & { code?: string }, url);
     process.exit(2);
   }
 }

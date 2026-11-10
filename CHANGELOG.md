@@ -23,6 +23,8 @@ identifiers and attribution are available in the pre-removal Git revision
 - `src/commands/doctor/checks/atom-fence-rows.ts` (new, a host-only `WAVE_CHECKS` entry, BRAIN category): `atom_fence_rows` warns with the count per source and the preview command.
 - Docs: `docs/guides/repair.md#atom-fence-rows` (what is listed, the apply, cost), `skills/RESOLVER.md`, key-files rows in `core-cycle.md`, `hindsight.md`, `core-cycle-patterns.md` and `memory-purge.md`.
 - Tests (PGLite and Postgres): `test/extract-atoms-world-fence-rows.test.ts` (cycle phase and managed brain: prompt, atoms and a remote read of each atom hold only world rows), `test/cycle-world-fence-rows.test.ts` (propose_takes input and proposals, patterns prompt and quote grounding), `test/repair-atom-fence-rows.test.ts` (doctor finding, preview changes nothing, apply without `--expect` refuses, apply narrows exactly the previewed atoms, unmanaged and managed).
+- `src/core/skillpack/registry-client.ts`, `src/commands/skillpack.ts`, `src/core/error-registry.ts`: a non-2xx response from the skillpack registry URL (the default registry is not published yet, so it answers HTTP 404) now fails as `registry_http_error`, naming the URL and the status and pointing at `--url` / `skillpack.registry_url`, instead of `no_cache_no_network` ("First-run installs require network") surfacing as `internal_error` with a `gbrain doctor` fix. A cache still wins over a failed fetch. Docs: `docs/skillpack-anatomy.md` (the default registry is not published yet), `docs/guides/error-codes.md#registry_http_error`.
+- Tests: `test/skillpack-registry-client.test.ts` (404/500 with no cache throw `registry_http_error` naming the URL and status; a 404 falls back to cache when one exists).
 
 ## [0.60.637.0] - 2026-11-10
 

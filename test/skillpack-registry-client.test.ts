@@ -256,6 +256,60 @@ describe('loadRegistry — cache fallback', () => {
   });
 });
 
+describe('loadRegistry — non-2xx HTTP responses', () => {
+  test('404 with no cache throws registry_http_error naming the URL and status', async () => {
+    const url = 'https://example.com/registry.json';
+    const fetchImpl = makeFetchImpl({
+      [url]: { body: {}, status: 404, ok: false },
+    });
+    try {
+      await loadRegistry({ url, cacheDir, fetchImpl });
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as RegistryClientError).code).toBe('registry_http_error');
+      expect((err as Error).message).toContain(url);
+      expect((err as Error).message).toContain('404');
+      expect((err as Error).message).not.toContain('require network');
+      expect((err as Error).message).toContain('--url');
+    }
+  });
+
+  test('500 with no cache throws registry_http_error, not no_cache_no_network', async () => {
+    const url = 'https://example.com/registry.json';
+    const fetchImpl = makeFetchImpl({
+      [url]: { body: {}, status: 500, ok: false },
+    });
+    try {
+      await loadRegistry({ url, cacheDir, fetchImpl });
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as RegistryClientError).code).toBe('registry_http_error');
+      expect((err as Error).message).toContain('500');
+    }
+  });
+
+  test('404 falls back to cache when one exists', async () => {
+    const url = 'https://example.com/registry.json';
+    const eurl = 'https://example.com/endorsements.json';
+    const fetchImpl1 = makeFetchImpl({
+      [url]: { body: CATALOG },
+      [eurl]: { body: ENDORSEMENTS },
+    });
+    await loadRegistry({ url, cacheDir, fetchImpl: fetchImpl1 });
+    const cacheFiles = require('fs').readdirSync(cacheDir);
+    const cf = join(cacheDir, cacheFiles[0]);
+    const data = JSON.parse(require('fs').readFileSync(cf, 'utf-8'));
+    data.fetched_at = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    writeFileSync(cf, JSON.stringify(data));
+    const fetch404 = makeFetchImpl({
+      [url]: { body: {}, status: 404, ok: false },
+    });
+    const r = await loadRegistry({ url, cacheDir, fetchImpl: fetch404 });
+    expect(r.origin).toBe('cache_soft_stale');
+    expect(r.catalog.skillpacks).toHaveLength(2);
+  });
+});
+
 describe('findPack + findPackWithTier', () => {
   test('finds entry by name; returns null when missing', async () => {
     const url = 'https://example.com/registry.json';
