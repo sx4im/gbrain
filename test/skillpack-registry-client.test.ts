@@ -233,6 +233,59 @@ describe('loadRegistry — cache fallback', () => {
     }
   });
 
+  test('throws registry_http_error (not no_cache_no_network) on HTTP 404 with no cache', async () => {
+    const url = 'https://example.com/registry.json';
+    const fetchImpl = makeFetchImpl({
+      [url]: { body: {}, status: 404, ok: false },
+    });
+    try {
+      await loadRegistry({ url, cacheDir, fetchImpl });
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as RegistryClientError).code).toBe('registry_http_error');
+      expect((err as Error).message).toContain(url);
+      expect((err as Error).message).toContain('404');
+    }
+  });
+
+  test('throws registry_http_error on HTTP 500 with no cache', async () => {
+    const url = 'https://example.com/registry.json';
+    const fetchImpl = makeFetchImpl({
+      [url]: { body: {}, status: 500, ok: false },
+    });
+    try {
+      await loadRegistry({ url, cacheDir, fetchImpl });
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as RegistryClientError).code).toBe('registry_http_error');
+      expect((err as Error).message).toContain(url);
+      expect((err as Error).message).toContain('500');
+    }
+  });
+
+  test('falls back to cache_soft_stale when the registry returns HTTP 404', async () => {
+    const url = 'https://example.com/registry.json';
+    const eurl = 'https://example.com/endorsements.json';
+    // Seed cache.
+    const fetchImpl1 = makeFetchImpl({
+      [url]: { body: CATALOG },
+      [eurl]: { body: ENDORSEMENTS },
+    });
+    await loadRegistry({ url, cacheDir, fetchImpl: fetchImpl1 });
+    // Hand-edit the cache file to make it look 2 hours old (past SOFT_TTL).
+    const cacheFiles = require('fs').readdirSync(cacheDir);
+    const cf = join(cacheDir, cacheFiles[0]);
+    const data = JSON.parse(require('fs').readFileSync(cf, 'utf-8'));
+    data.fetched_at = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    writeFileSync(cf, JSON.stringify(data));
+    // Now the registry 404s.
+    const fetchImpl404 = makeFetchImpl({
+      [url]: { body: {}, status: 404, ok: false },
+    });
+    const r = await loadRegistry({ url, cacheDir, fetchImpl: fetchImpl404 });
+    expect(r.origin).toBe('cache_soft_stale');
+  });
+
   test('noNetwork=true uses cache when present', async () => {
     const url = 'https://example.com/registry.json';
     const eurl = 'https://example.com/endorsements.json';

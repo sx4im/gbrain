@@ -70,6 +70,7 @@ export interface LoadedRegistry {
 
 export type RegistryClientErrorCode =
   | 'no_cache_no_network'
+  | 'registry_http_error'
   | 'fetch_succeeded_but_schema_invalid'
   | 'cache_corrupt'
   | 'url_invalid';
@@ -222,7 +223,14 @@ export async function loadRegistry(opts: LoadRegistryOptions = {}): Promise<Load
       }
 
       if (!catalogRes.ok) {
-        throw new Error(`HTTP ${catalogRes.status} ${catalogRes.statusText}`);
+        // A non-2xx response is not a network failure: the URL answered, but
+        // the registry is not there (e.g. HTTP 404 on the default URL). Give
+        // it its own code naming the URL and the status, instead of the
+        // "First-run installs require network" text below.
+        throw new RegistryClientError(
+          `registry at ${url} returned HTTP ${catalogRes.status} ${catalogRes.statusText}. Point skillpack.registry_url at a registry that exists (gbrain skillpack registry --url <URL>).`,
+          'registry_http_error',
+        );
       }
 
       const catalogJson = await catalogRes.json();
@@ -267,8 +275,11 @@ export async function loadRegistry(opts: LoadRegistryOptions = {}): Promise<Load
       };
     } catch (err) {
       // Schema-invalid responses are a hard failure — don't degrade to cache.
-      if (err instanceof RegistryClientError) throw err;
-      // Network failure — fall through to cache.
+      // An HTTP error keeps its own code through the cache fallback below:
+      // with a cache we serve it (and warn with the URL + status), without
+      // one the caller sees the HTTP error, not "requires network".
+      if (err instanceof RegistryClientError && err.code !== 'registry_http_error') throw err;
+      // Network failure or HTTP error — fall through to cache.
       if (cached) {
         const ageMs = Date.now() - new Date(cached.fetched_at).getTime();
         const origin: LoadedRegistry['origin'] =
@@ -289,6 +300,7 @@ export async function loadRegistry(opts: LoadRegistryOptions = {}): Promise<Load
           registry_url: url,
         };
       }
+      if (err instanceof RegistryClientError) throw err;
       throw new RegistryClientError(
         `registry fetch failed (${(err as Error).message}) and no on-disk cache exists. First-run installs require network.`,
         'no_cache_no_network',
